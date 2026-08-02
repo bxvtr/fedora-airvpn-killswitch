@@ -1,0 +1,51 @@
+{
+  // Cursor IDE workspace permissions (JSONC).
+  // Applies only when a supported Cursor Run Mode / Auto-review path is enabled.
+  // This file is defense-in-depth, not a complete security boundary.
+  // It does not configure the Cursor CLI (see .cursor/cli.json) or Bugbot
+  // (see .cursor/BUGBOT.md). Project rules live under .cursor/rules/*.mdc.
+  //
+  // Important: defining terminalAllowlist here replaces the in-app terminal
+  // allowlist for this category when the file is honored by your Cursor build.
+  // Some Cursor versions may only reliably load ~/.cursor/permissions.json;
+  // mirror critical entries there if project-level allowlists are ignored.
+  // Do not enable "Run Everything". Prefer Allowlist + sandboxing.
+  // MCP tools are intentionally omitted from any allowlist.
+  //
+  // Matching is command-prefix based: do not allowlist "git branch" because it
+  // would also auto-allow mutating forms such as "git branch -D".
+
+  "terminalAllowlist": [
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "git rev-parse",
+    "tools/validate-safe",
+    "tools/check-agent-safety",
+    "./tools/validate-safe",
+    "./tools/check-agent-safety"
+  ],
+
+  "autoRun": {
+    "allow_instructions": [
+      "Allow only clearly read-only Git inspection (status, diff, log, show, rev-parse) and the repository-owned static wrappers tools/validate-safe and tools/check-agent-safety when they match reviewed sources.",
+      "Allow non-mutating repository file reads inside the workspace that are needed for code review."
+    ],
+    "block_instructions": [
+      "Always require explicit user approval for any privileged command, including sudo, su, doas, absolute-path variants such as /usr/bin/sudo, and any attempt to elevate privileges.",
+      "Always require explicit user approval for package management (dnf, dnf5, rpm, rpm-ostree, pip install, ansible-galaxy when it downloads, or any package install).",
+      "Always require explicit user approval for host service management (systemctl, reboot, shutdown, poweroff, suspend, hibernate).",
+      "Always require explicit user approval for NetworkManager mutations (nmcli connection add/modify/delete/up/down/reload) and any live nmcli that changes host state.",
+      "Always require explicit user approval for firewalld or WireGuard commands (firewall-cmd, wg, wg-quick) and for disabling firewalld or the project kill switch.",
+      "Always require explicit user approval for writes outside the workspace, including /etc, /usr, /var, /run, /boot, and /root.",
+      "Always require explicit user approval for live Ansible playbook execution (any ansible-playbook without --syntax-check, bootstrap.sh install paths, or verify/uninstall against the host).",
+      "Always require explicit user approval for installed AirVPN runtime commands (airvpn-import, airvpn-switch, airvpn-firewall-sync, airvpn-protect-connection, airvpn-killswitch, airvpn-check, airvpn-status when used to drive host changes).",
+      "Always require explicit user approval for indirect execution that appears intended to bypass restrictions (bash -c, sh -c, eval, env, command, xargs, make targets wrapping forbidden tools, Python subprocesses launching forbidden tools, absolute paths to denied tools, or rewriting allowlisted wrappers then immediately running them).",
+      "Always require explicit user approval before reading likely secret locations (real AirVPN configs, WireGuard private keys, NetworkManager system-connections, .env files, or paths outside the workspace sought for credentials).",
+      "Always require explicit user approval for network downloads or uploads (curl, wget, scp, ssh, pushing artifacts, fetching remote packages).",
+      "Always require explicit user approval for Git pushes, force pushes, resets, rebases, clean -fdx, checkout/switch that changes branches or files, merge, or any direct change to main/master.",
+      "Always require explicit user approval when Cursor safety files (.cursor/permissions.json, .cursor/cli.json, .cursor/rules, tools/validate-safe, tools/check-agent-safety) were just modified and the agent then tries to run newly allowed or rewritten commands. Git-tracked wrappers are not immutable."
+    ]
+  }
+}

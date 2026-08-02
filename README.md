@@ -88,6 +88,31 @@ AirVPN WireGuard `.conf` files contain **private keys**.
 - Keep source directories mode `0700` and files mode `0600` when practical.
 - This project copies configs only to a root-owned directory (`/etc/airvpn-client/configs` by default).
 
+## Cursor agent safety (local development)
+
+This repository includes defense-in-depth Cursor guardrails for local agents.
+They guide static code work and reduce accidental live host changes. They are
+**not** a complete security boundary and do **not** replace OS permissions,
+manual approval of commands, avoiding passwordless sudo, or a disposable VM
+for live NetworkManager/firewalld tests.
+
+| File | Role |
+| --- | --- |
+| `.cursor/permissions.json` | Cursor **IDE** allowlist / Auto-review guidance (when a supported Run Mode is enabled) |
+| `.cursor/cli.json` | Cursor **CLI** allow/deny permissions |
+| `.cursor/rules/*.mdc` | Local Agent project rules (instructions, not a sandbox) |
+| `.cursor/BUGBOT.md` | Bugbot review instructions only |
+
+Preferred static validation:
+
+```bash
+tools/check-agent-safety
+tools/validate-safe
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the recommended Cursor UI setup and
+limitations. The repository cannot change your global Cursor settings for you.
+
 ## Quick start
 
 1. Export WireGuard configs from AirVPN (prefer **numeric IP** endpoints).

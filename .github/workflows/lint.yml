@@ -53,8 +53,8 @@ jobs:
         run: |
           set -Eeuo pipefail
           mapfile -t files < <(
-            find bootstrap.sh roles/airvpn_client/files tests/unit \
-              -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \) \
+            find bootstrap.sh roles/airvpn_client/files tests/unit tools \
+              -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' \) \
               | sort
           )
           shellcheck -x -S error "${files[@]}"

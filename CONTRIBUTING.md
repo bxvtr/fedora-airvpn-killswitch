@@ -16,6 +16,50 @@ This project is unofficial and not affiliated with AirVPN.
 - Do not add tests that require mutating a contributor's live firewall in CI.
 - Prefer fail-closed behavior over convenience.
 
+## Recommended local Cursor setup
+
+This repository configures privileged networking. Cursor safety files are
+**defense in depth**, not a complete security boundary. They do **not** replace
+OS user permissions, manual command review, avoiding passwordless sudo,
+workspace isolation, or a disposable VM for live network tests.
+
+Recommended practices:
+
+- Run Cursor as a normal unprivileged user. Never run Cursor with `sudo`.
+- Avoid passwordless sudo on development hosts.
+- Use Cursor **Allowlist** mode with sandboxing for this repository.
+- Do **not** use **Run Everything**.
+- Keep Auto-fix disabled for security-sensitive findings.
+- Prefer Ask or Plan mode for initial review of networking or firewall changes.
+- Use `tools/validate-safe` for static checks and `tools/check-agent-safety`
+  to verify repository guardrail files.
+- Manually inspect every command approval prompt.
+- Keep real AirVPN configurations **outside** the workspace.
+- Run live Fedora integration tests only with explicit human authorization,
+  preferably in a disposable VM with a snapshot.
+- Treat Background or Cloud Agents as **code-development** environments only,
+  not as places for real host-network tests.
+
+### Cursor file roles (do not conflate)
+
+| Path | Applies to |
+| --- | --- |
+| `.cursor/permissions.json` | Supported Cursor **IDE** run modes / Auto-review allowlists and block guidance |
+| `.cursor/cli.json` | Cursor **CLI** project permissions (`allow` / `deny`) |
+| `.cursor/rules/*.mdc` | Local **Agent** project instructions (not a technical sandbox) |
+| `.cursor/BUGBOT.md` | **Bugbot** PR review guidance only |
+
+The repository cannot configure your global Cursor UI settings automatically.
+If project-level IDE allowlists are ignored by your Cursor build, mirror the
+`terminalAllowlist` entries in `~/.cursor/permissions.json` as needed.
+
+These controls are **not immutable**. An agent (or human) with edit approval can
+change `.cursor/` files and `tools/validate-safe` / `tools/check-agent-safety`.
+Always review such diffs and re-read wrapper contents before approving their
+execution. OS permissions and disposable VMs remain stronger controls than
+repository policy files. Local `.mdc` rules are instructions, not a sandbox;
+IDE and CLI use separate permission files.
+
 ## Development setup
 
 ```bash
@@ -28,11 +72,26 @@ pre-commit install
 
 ## Local checks
 
+Preferred agent-safe entry point (static only; skips unavailable tools; never
+installs packages; never runs live playbooks or AirVPN runtime commands):
+
+```bash
+tools/check-agent-safety
+tools/validate-safe
+```
+
+`tools/validate-safe` intentionally omits `pre-commit` because hooks may
+download environments, install hook dependencies, and the repository shfmt hook
+uses `-w` (writes). You may still run `pre-commit run --all-files` yourself
+after reviewing `.pre-commit-config.yaml`.
+
+Manual equivalents:
+
 ```bash
 bash tests/unit/run_all.sh
 yamllint -c .yamllint .
 ansible-lint
-find bootstrap.sh roles/airvpn_client/files tests/unit -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \) -print0 | xargs -0 shellcheck -x -S error
+find bootstrap.sh roles/airvpn_client/files tests/unit tools -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' \) -print0 | xargs -0 shellcheck -x -S error
 for pb in playbooks/*.yml; do
   ansible-playbook --syntax-check "$pb" -e airvpn_config_source=/tmp/dummy -e airvpn_uninstall_confirmed=true
 done

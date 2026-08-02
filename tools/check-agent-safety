@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# Read-only self-check for Cursor agent safety configuration.
+# Passing does NOT prove the environment is secure.
+set -Eeuo pipefail
+
+PASS_N=0
+FAIL_N=0
+WARN_N=0
+
+pass() {
+  printf 'PASS: %s\n' "$1"
+  PASS_N=$((PASS_N + 1))
+}
+
+fail() {
+  printf 'FAIL: %s\n' "$1"
+  FAIL_N=$((FAIL_N + 1))
+}
+
+warn() {
+  printf 'WARN: %s\n' "$1"
+  WARN_N=$((WARN_N + 1))
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+if [[ "${EUID}" -eq 0 ]]; then
+  die "Refusing to run as root"
+fi
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+[[ -n "${ROOT}" && -d "${ROOT}/.git" && -f "${ROOT}/README.md" ]] || die "Could not establish repository root"
+cd "${ROOT}"
+
+printf '=== tools/check-agent-safety ===\n'
+printf 'Repository: %s\n' "${ROOT}"
+printf 'Limitation: this check only inspects repository files. It cannot enforce\n'
+printf 'OS permissions, Cursor UI mode, or prevent an agent with edit rights from\n'
+printf 'later changing these guardrails.\n\n'
+
+require_file() {
+  local path="$1"
+  if [[ -f "${path}" ]]; then
+    pass "exists ${path}"
+  else
+    fail "missing ${path}"
+  fi
+}
+
+require_file ".cursor/BUGBOT.md"
+require_file ".cursor/permissions.json"
+require_file ".cursor/cli.json"
+require_file ".cursor/rules/safe-local-development.mdc"
+require_file "tools/validate-safe"
+require_file "tools/check-agent-safety"
+
+if [[ -x tools/validate-safe ]]; then
+  pass "tools/validate-safe is executable"
+else
+  fail "tools/validate-safe is not executable"
+fi
+if [[ -x tools/check-agent-safety ]]; then
+  pass "tools/check-agent-safety is executable"
+else
+  fail "tools/check-agent-safety is not executable"
+fi
+
+rule=".cursor/rules/safe-local-development.mdc"
+if [[ -f "${rule}" ]]; then
+  if head -n 5 "${rule}" | grep -q '^---$' &&
+    grep -q '^alwaysApply: true$' "${rule}" &&
+    grep -q '^description:' "${rule}"; then
+    pass "safe-local-development.mdc has alwaysApply frontmatter"
+  else
+    fail "safe-local-development.mdc frontmatter incomplete"
+  fi
+fi
+
+if ! command -v python3 >/dev/null 2>&1; then
+  fail "python3 unavailable; cannot validate JSON/JSONC"
+else
+  if python3 - <<'PY'
+import json, pathlib, re, sys
+
+root = pathlib.Path(".")
+
+def load_jsonc(path: pathlib.Path):
+    text = path.read_text(encoding="utf-8")
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    text = re.sub(r"(?m)^\s*//.*?$", "", text)
+    return json.loads(text)
+
+try:
+    perms = load_jsonc(root / ".cursor/permissions.json")
+except Exception as e:
+    print(f"permissions.json parse error: {e}")
+    sys.exit(1)
+
+try:
+    cli = json.loads((root / ".cursor/cli.json").read_text(encoding="utf-8"))
+except Exception as e:
+    print(f"cli.json parse error: {e}")
+    sys.exit(1)
+
+if not isinstance(perms.get("terminalAllowlist"), list):
+    print("permissions.json missing terminalAllowlist array")
+    sys.exit(1)
+if "autoRun" not in perms or "block_instructions" not in perms["autoRun"]:
+    print("permissions.json missing autoRun.block_instructions")
+    sys.exit(1)
+
+allow = set(perms["terminalAllowlist"])
+needed = {
+    "git status",
+    "git diff",
+    "git log",
+    "git show",
+    "tools/validate-safe",
+    "tools/check-agent-safety",
+}
+missing = sorted(needed - allow)
+if missing:
+    print("terminalAllowlist missing: " + ", ".join(missing))
+    sys.exit(1)
+
+for entry in allow:
+    if entry in {"git", "bash", "sh", "python", "python3", "ansible-playbook", "pre-commit", "make"}:
+        print(f"overly broad terminalAllowlist entry: {entry}")
+        sys.exit(1)
+    # Prefix matching would auto-allow mutating forms (e.g. git branch -D).
+    if entry == "git branch" or entry.startswith("git branch "):
+        print(f"unsafe terminalAllowlist prefix: {entry}")
+        sys.exit(1)
+
+if cli.get("version") != 1:
+    print("cli.json version must be 1")
+    sys.exit(1)
+perm = cli.get("permissions") or {}
+deny = perm.get("deny") or []
+allow_cli = perm.get("allow") or []
+if not isinstance(deny, list) or not isinstance(allow_cli, list):
+    print("cli.json permissions.allow/deny must be arrays")
+    sys.exit(1)
+
+required_deny = [
+    "Shell(sudo)",
+    "Shell(/usr/bin/sudo)",
+    "Shell(firewall-cmd)",
+    "Shell(nmcli)",
+    "Shell(wg)",
+    "Shell(rpm-ostree)",
+    "Shell(dnf)",
+    "Shell(systemctl)",
+    "Shell(airvpn-import)",
+    "Shell(airvpn-switch)",
+    "Shell(airvpn-killswitch)",
+    "Shell(bash)",
+    "Shell(env)",
+    "Shell(command)",
+    "Read(/etc/wireguard/**)",
+    "Write(/etc/**)",
+    "Write(tools/validate-safe)",
+    "Write(tools/check-agent-safety)",
+    "Write(.cursor/rules/**)",
+]
+missing_deny = [x for x in required_deny if x not in deny]
+if missing_deny:
+    print("cli.json deny missing: " + ", ".join(missing_deny))
+    sys.exit(1)
+
+required_allow = [
+    "Shell(tools/validate-safe)",
+    "Shell(tools/check-agent-safety)",
+]
+missing_allow = [x for x in required_allow if x not in allow_cli]
+if missing_allow:
+    print("cli.json allow missing: " + ", ".join(missing_allow))
+    sys.exit(1)
+
+if "Shell(git)" in allow_cli:
+    print("cli.json must not allow unrestricted Shell(git)")
+    sys.exit(1)
+for entry in allow_cli:
+    if entry.startswith("Shell(git:branch"):
+        print(f"cli.json must not allowlist git branch prefixes: {entry}")
+        sys.exit(1)
+
+sys.exit(0)
+PY
+  then
+    pass "permissions.json / cli.json parse and required entries"
+  else
+    fail "permissions.json / cli.json validation"
+  fi
+fi
+
+block_file=".cursor/permissions.json"
+for needle in sudo firewall-cmd nmcli WireGuard ansible-playbook push force secret bypass; do
+  if grep -q -i "${needle}" "${block_file}"; then
+    pass "block_instructions mention ${needle}"
+  else
+    fail "block_instructions missing mention of ${needle}"
+  fi
+done
+
+# Only scan validate-safe for host-mutating invocations (avoid self-matching this script).
+if grep -E -q '(^|[[:space:];|&`])(sudo|su|doas|firewall-cmd|nmcli|rpm-ostree|systemctl|reboot|shutdown|poweroff|airvpn-import|airvpn-switch|airvpn-killswitch)([[:space:];|&]|$)' \
+  tools/validate-safe; then
+  fail "tools/validate-safe appears to invoke a forbidden host command"
+else
+  pass "tools/validate-safe has no obvious forbidden host command invocations"
+fi
+
+# wg as a command token (avoid matching words like "wrong")
+if grep -E -q '(^|[[:space:];|&`])wg([[:space:];|&]|$)' tools/validate-safe; then
+  fail "tools/validate-safe appears to invoke wg"
+else
+  pass "tools/validate-safe does not invoke wg"
+fi
+
+# Ignore documentation/skip/have_cmd strings; command invocations must include --syntax-check.
+if grep -E '(^|[[:space:]])ansible-playbook([[:space:]]|$)' tools/validate-safe |
+  grep -vE 'have_cmd |skip "' |
+  grep -v -- '--syntax-check' >/dev/null; then
+  fail "validate-safe ansible-playbook without --syntax-check"
+else
+  pass "validate-safe ansible-playbook always uses --syntax-check"
+fi
+
+conf_bad=0
+while IFS= read -r path; do
+  [[ -z "${path}" ]] && continue
+  case "${path}" in
+    tests/fixtures/*.conf) ;;
+    *)
+      printf 'FAIL: tracked conf outside fixtures: %s\n' "${path}"
+      conf_bad=1
+      ;;
+  esac
+done < <(git ls-files '*.conf')
+if ((conf_bad == 0)); then
+  pass "no tracked AirVPN .conf outside fixtures"
+else
+  fail "tracked AirVPN .conf outside fixtures"
+fi
+
+secret_hit=0
+while IFS= read -r -d '' f; do
+  if grep -E -q 'PrivateKey[[:space:]]*=[[:space:]]*[A-Za-z0-9+/]{40,}=' "${f}" 2>/dev/null; then
+    printf 'FAIL: possible key material in safety file: %s\n' "${f}"
+    secret_hit=1
+  fi
+done < <(find .cursor tools -type f -print0)
+if ((secret_hit == 0)); then
+  pass "safety files lack PrivateKey-looking assignments"
+else
+  fail "possible secrets in safety files"
+fi
+
+printf '\n=== summary ===\n'
+printf 'PASS: %s\n' "${PASS_N}"
+printf 'FAIL: %s\n' "${FAIL_N}"
+printf 'WARN: %s\n' "${WARN_N}"
+printf '\nPassing this check does NOT prove Cursor, the OS, or the host network are secure.\n'
+printf 'Manual Cursor UI settings (Allowlist mode, sandbox, no Run Everything) remain required.\n'
+
+if ((FAIL_N > 0)); then
+  exit 1
+fi
+exit 0
