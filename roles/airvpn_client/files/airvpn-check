@@ -175,10 +175,17 @@ check_profiles() {
 }
 
 check_unsafe_physical() {
-  while IFS=: read -r uuid name ctype _device state; do
+  local line uuid name ctype state zone
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 5)) || continue
+    uuid="${AIRVPN_NM_FIELDS[0]}"
+    name="${AIRVPN_NM_FIELDS[1]}"
+    ctype="${AIRVPN_NM_FIELDS[2]}"
+    state="${AIRVPN_NM_FIELDS[4]}"
     [[ "${ctype}" == "802-11-wireless" || "${ctype}" == "802-3-ethernet" ]] || continue
     [[ "${state}" == "activated" ]] || continue
-    local zone
     zone="$(nmcli -g connection.zone connection show "${uuid}")"
     if [[ "${zone}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
       fail "active physical connection '${name}' not in underlay zone (zone=${zone:-unset})"

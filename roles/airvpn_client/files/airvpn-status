@@ -52,7 +52,15 @@ done
 
 echo
 echo "--- Physical connections ---"
-while IFS=: read -r uuid name ctype device state; do
+while IFS= read -r line; do
+  [[ -n "${line}" ]] || continue
+  airvpn_nmcli_split_terse "${line}"
+  ((${#AIRVPN_NM_FIELDS[@]} >= 5)) || continue
+  uuid="${AIRVPN_NM_FIELDS[0]}"
+  name="${AIRVPN_NM_FIELDS[1]}"
+  ctype="${AIRVPN_NM_FIELDS[2]}"
+  device="${AIRVPN_NM_FIELDS[3]}"
+  state="${AIRVPN_NM_FIELDS[4]}"
   [[ "${ctype}" == "802-11-wireless" || "${ctype}" == "802-3-ethernet" ]] || continue
   zone="$(nmcli -g connection.zone connection show "${uuid}" 2>/dev/null || echo "")"
   echo "physical: ${name} type=${ctype} state=${state} zone=${zone:-unset} device=${device:-none}"

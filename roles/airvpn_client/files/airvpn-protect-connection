@@ -25,26 +25,42 @@ fi
 
 airvpn_load_config
 airvpn_require_root
-airvpn_require_cmds nmcli
+airvpn_require_cmds nmcli flock
 
-# Resolve UUID
-UUID="$(nmcli -t -f UUID,NAME connection show | awk -F: -v t="${TARGET}" '$1==t || $2==t {print $1; exit}')"
-[[ -n "${UUID}" ]] || airvpn_die "Connection not found: ${TARGET}"
+protect_main() {
+  local line uuid name
+  UUID=""
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 2)) || continue
+    uuid="${AIRVPN_NM_FIELDS[0]}"
+    name="${AIRVPN_NM_FIELDS[1]}"
+    if [[ "${uuid}" == "${TARGET}" || "${name}" == "${TARGET}" ]]; then
+      UUID="${uuid}"
+      break
+    fi
+  done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null || true)
 
-TYPE="$(nmcli -g connection.type connection show "${UUID}")"
-NAME="$(nmcli -g connection.id connection show "${UUID}")"
+  [[ -n "${UUID}" ]] || airvpn_die "Connection not found: ${TARGET}"
 
-case "${TYPE}" in
-  802-11-wireless | 802-3-ethernet) ;;
-  wireguard)
-    airvpn_die "Refusing to move WireGuard connection '${NAME}' into the underlay zone"
-    ;;
-  *)
-    airvpn_die "Unsupported connection type '${TYPE}' for '${NAME}'. Only Wi-Fi and Ethernet are supported."
-    ;;
-esac
+  TYPE="$(nmcli -g connection.type connection show "${UUID}")"
+  NAME="$(nmcli -g connection.id connection show "${UUID}")"
 
-# Do not touch loopback or bridge-like types (already filtered by type).
-nmcli connection modify uuid "${UUID}" connection.zone "${AIRVPN_UNDERLAY_ZONE}"
-airvpn_log "INFO" "Protected '${NAME}' (${UUID}) -> zone ${AIRVPN_UNDERLAY_ZONE}"
-airvpn_log "INFO" "Re-activate the connection if it is currently up for the zone to apply immediately"
+  case "${TYPE}" in
+    802-11-wireless | 802-3-ethernet) ;;
+    wireguard)
+      airvpn_die "Refusing to move WireGuard connection '${NAME}' into the underlay zone"
+      ;;
+    *)
+      airvpn_die "Unsupported connection type '${TYPE}' for '${NAME}'. Only Wi-Fi and Ethernet are supported."
+      ;;
+  esac
+
+  # Do not touch loopback or bridge-like types (already filtered by type).
+  nmcli connection modify uuid "${UUID}" connection.zone "${AIRVPN_UNDERLAY_ZONE}"
+  airvpn_log "INFO" "Protected '${NAME}' (${UUID}) -> zone ${AIRVPN_UNDERLAY_ZONE}"
+  airvpn_log "INFO" "Re-activate the connection if it is currently up for the zone to apply immediately"
+}
+
+airvpn_with_lock protect protect_main

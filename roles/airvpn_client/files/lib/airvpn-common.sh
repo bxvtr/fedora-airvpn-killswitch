@@ -70,18 +70,72 @@ airvpn_redact() {
     -e 's/(PresharedKey[[:space:]]*=[[:space:]]*).*/\1<redacted>/Ig'
 }
 
-# Acquire an exclusive lock for mutating operations.
+# Acquire the single project-wide exclusive lock for all mutating operations.
+# Nested same-process calls and child processes re-enter safely only when FD 9
+# already refers to the lock file and flock succeeds on that inherited OFD
+# (import → airvpn-firewall-sync). Environment variables are never trusted to
+# skip locking: AIRVPN_LOCK_HELD is ignored if set by a caller.
 # Usage: airvpn_with_lock <lock_name> <command> [args...]
+# Lock FD: 9 (must stay open across nested exec of project helpers).
 airvpn_with_lock() {
   local lock_name="$1"
   shift
-  local lock_path="${AIRVPN_LOCK_FILE}.${lock_name}"
-  mkdir -p "$(dirname "${lock_path}")"
+  local lock_path="${AIRVPN_LOCK_FILE}"
+  local lock_dir lock_realpath fd_target
+  lock_dir="$(dirname "${lock_path}")"
+  mkdir -p "${lock_dir}"
+  # Ensure the lock file exists so readlink -f resolves a stable path.
+  : >>"${lock_path}" || true
+  chmod 0600 "${lock_path}" 2>/dev/null || true
+  lock_realpath="$(readlink -f "${lock_path}")"
+
+  if [[ -e /proc/self/fd/9 ]]; then
+    fd_target="$(readlink -f /proc/self/fd/9 2>/dev/null || true)"
+    if [[ -n "${fd_target}" && "${fd_target}" == "${lock_realpath}" ]]; then
+      # FD 9 already open on our lock file (nested call or inherited OFD).
+      if flock -n 9; then
+        "$@"
+        return
+      fi
+      airvpn_die "Another airvpn-client mutating operation holds the lock (${lock_path}; while starting '${lock_name}')"
+    fi
+  fi
+
+  # One lock file for import/switch/firewall/killswitch/protect.
   exec 9>"${lock_path}"
+  chmod 0600 "${lock_path}" 2>/dev/null || true
   if ! flock -n 9; then
-    airvpn_die "Another airvpn-client operation holds the '${lock_name}' lock (${lock_path})"
+    airvpn_die "Another airvpn-client mutating operation holds the lock (${lock_path}; while starting '${lock_name}')"
   fi
   "$@"
+}
+
+# Split a NetworkManager terse (-t) line on unescaped ':' fields.
+# NM escapes ':' as '\:' and '\' as '\\' inside field values.
+# Result: AIRVPN_NM_FIELDS array
+airvpn_nmcli_split_terse() {
+  local line="$1"
+  AIRVPN_NM_FIELDS=()
+  local field=""
+  local i=0
+  local len=${#line}
+  local c
+  while ((i < len)); do
+    c="${line:i:1}"
+    if [[ "${c}" == '\' ]]; then
+      i=$((i + 1))
+      if ((i < len)); then
+        field+="${line:i:1}"
+      fi
+    elif [[ "${c}" == ':' ]]; then
+      AIRVPN_NM_FIELDS+=("${field}")
+      field=""
+    else
+      field+="${c}"
+    fi
+    i=$((i + 1))
+  done
+  AIRVPN_NM_FIELDS+=("${field}")
 }
 
 # ---------------------------------------------------------------------------
@@ -203,8 +257,16 @@ airvpn_wg_field() {
 # Prints: uuid|name|type|device|state  using machine-readable nmcli fields.
 airvpn_list_managed_connections() {
   local prefix="${AIRVPN_CONNECTION_PREFIX}"
-  local uuid name ctype device state
-  while IFS=: read -r uuid name ctype device state; do
+  local line uuid name ctype device state
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 5)) || continue
+    uuid="${AIRVPN_NM_FIELDS[0]}"
+    name="${AIRVPN_NM_FIELDS[1]}"
+    ctype="${AIRVPN_NM_FIELDS[2]}"
+    device="${AIRVPN_NM_FIELDS[3]}"
+    state="${AIRVPN_NM_FIELDS[4]}"
     [[ -n "${uuid}" ]] || continue
     if [[ "${name}" == "${prefix}"* ]]; then
       printf '%s|%s|%s|%s|%s\n' "${uuid}" "${name}" "${ctype}" "${device}" "${state}"
@@ -353,6 +415,71 @@ airvpn_endpoint_rich_rule() {
   local port="$3"
   printf 'rule family="%s" destination address="%s" port port="%s" protocol="udp" accept' \
     "${family}" "${ip}" "${port}"
+}
+
+# Return 0 if rule text is exactly a project-generated endpoint rich rule.
+# Rejects arbitrary strings before they are passed to firewall-cmd.
+airvpn_validate_endpoint_rich_rule() {
+  local rule="$1"
+  local family ip port expected rc
+  if [[ ! "${rule}" =~ ^rule\ family=\"(ipv4|ipv6)\"\ destination\ address=\"([^\"]+)\"\ port\ port=\"([0-9]{1,5})\"\ protocol=\"udp\"\ accept$ ]]; then
+    return 1
+  fi
+  family="${BASH_REMATCH[1]}"
+  ip="${BASH_REMATCH[2]}"
+  port="${BASH_REMATCH[3]}"
+  ((10#${port} >= 1 && 10#${port} <= 65535)) || return 1
+  expected="$(airvpn_endpoint_rich_rule "${family}" "${ip}" "${port}")"
+  [[ "${rule}" == "${expected}" ]] || return 1
+  if [[ "${family}" == "ipv4" ]]; then
+    airvpn_parse_endpoint "${ip}:${port}"
+    rc=$?
+  else
+    airvpn_parse_endpoint "[${ip}]:${port}"
+    rc=$?
+  fi
+  ((rc == 0))
+}
+
+# Filter stdin lines: emit only validated endpoint rich rules (skip comments/blank/invalid).
+airvpn_filter_owned_endpoint_rules() {
+  local line
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+    if airvpn_validate_endpoint_rich_rule "${line}"; then
+      printf '%s\n' "${line}"
+    fi
+  done
+}
+
+# Compute owned rules that should be removed: in owned+present, not in desired.
+# Args via stdin are unused; pass three NUL-safe lists as arguments is awkward in
+# bash — callers set namerefs or use the helper below with arrays.
+airvpn_owned_rules_to_remove() {
+  # Usage: airvpn_owned_rules_to_remove <desired_file> <owned_file> <current_file>
+  # Prints rules that are project-owned, currently present, and no longer desired.
+  local desired_file="$1"
+  local owned_file="$2"
+  local current_file="$3"
+  local r
+  declare -A want=() have=()
+  while IFS= read -r r || [[ -n "${r}" ]]; do
+    [[ -n "${r}" ]] || continue
+    airvpn_validate_endpoint_rich_rule "${r}" || continue
+    want["${r}"]=1
+  done <"${desired_file}"
+  while IFS= read -r r || [[ -n "${r}" ]]; do
+    [[ -n "${r}" ]] || continue
+    have["${r}"]=1
+  done <"${current_file}"
+  while IFS= read -r r || [[ -n "${r}" ]]; do
+    [[ -n "${r}" ]] || continue
+    airvpn_validate_endpoint_rich_rule "${r}" || continue
+    if [[ -z "${want[${r}]+x}" && -n "${have[${r}]+x}" ]]; then
+      printf '%s\n' "${r}"
+    fi
+  done <"${owned_file}"
 }
 
 # Collect unique endpoints from managed config dir. Prints: family|ip|port

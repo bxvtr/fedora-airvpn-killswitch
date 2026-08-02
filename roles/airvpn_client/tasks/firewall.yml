@@ -133,6 +133,6 @@
   register: airvpn_fw_sync
   changed_when: >-
     ('Adding endpoint exception' in (airvpn_fw_sync.stderr | default('')))
-    or ('Removing obsolete endpoint rule' in (airvpn_fw_sync.stderr | default('')))
+    or ('Removing obsolete project-owned endpoint rule' in (airvpn_fw_sync.stderr | default('')))
     or ('Adding baseline underlay allowance' in (airvpn_fw_sync.stderr | default('')))
     or ('firewalld reloaded' in (airvpn_fw_sync.stderr | default('')))

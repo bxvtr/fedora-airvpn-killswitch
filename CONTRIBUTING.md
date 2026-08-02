@@ -29,7 +29,7 @@ pre-commit install
 ## Local checks
 
 ```bash
-bash tests/unit/test_parsing.sh
+bash tests/unit/run_all.sh
 yamllint -c .yamllint .
 ansible-lint
 find bootstrap.sh roles/airvpn_client/files tests/unit -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \) -print0 | xargs -0 shellcheck -x -S error

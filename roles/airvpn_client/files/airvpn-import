@@ -15,7 +15,12 @@ Import AirVPN WireGuard .conf files into NetworkManager as managed profiles,
 harden them, and synchronize firewalld endpoint exceptions.
 
   --source DIR   Directory containing AirVPN .conf files (required)
-  --mode MODE    add (default): import missing profiles only
+  --mode MODE    add (default): import missing profiles; refresh managed
+                 .conf copies for existing profiles; harden NM metadata.
+                 Does NOT re-import WireGuard keys/peers into an existing
+                 NetworkManager profile — use --mode replace for a full
+                 re-import after peer/key/endpoint changes that must apply
+                 to the live NM connection.
                  replace: remove project-managed profiles, then re-import
   --dry-run      Show actions without changing the system
   -h, --help     Show this help
@@ -125,7 +130,8 @@ harden_profile() {
 
 import_one() {
   local file="$1"
-  local base label conn_name endpoint pubkey ifname existing tmpdir imported_uuid
+  local base label conn_name endpoint pubkey ifname existing dest
+  local tmpdir imported_uuid import_out line cand_uuid cand_name
   base="$(basename "${file}")"
   label="$(label_from_filename "${base}")"
   conn_name="${AIRVPN_CONNECTION_PREFIX}${label}"
@@ -146,22 +152,23 @@ import_one() {
 
   ifname="$(airvpn_iface_name "${pubkey}" "${endpoint}")"
 
-  if existing="$(profile_exists_for_ifname "${ifname}")"; then
-    if [[ "${MODE}" == "add" ]]; then
-      airvpn_log "INFO" "Profile for interface ${ifname} already exists (${conn_name}); hardening only"
-      harden_profile "${existing}" "${ifname}"
-      run_or_echo nmcli connection modify uuid "${existing}" connection.id "${conn_name}"
-      return 0
-    fi
-  fi
-
-  # Copy to managed dir with safe permissions
+  # Always refresh the root-owned managed copy so endpoint sync sees updates,
+  # even when the NetworkManager profile already exists in add mode.
   run_or_echo install -d -m 0700 -o root -g root "${AIRVPN_MANAGED_CONFIG_DIR}"
-  local dest="${AIRVPN_MANAGED_CONFIG_DIR}/${base}"
+  dest="${AIRVPN_MANAGED_CONFIG_DIR}/${base}"
   if ((DRY_RUN)); then
     printf 'DRY-RUN: install -m 0600 %s %s\n' "${file}" "${dest}"
   else
     install -m 0600 -o root -g root "${file}" "${dest}"
+  fi
+
+  if existing="$(profile_exists_for_ifname "${ifname}")"; then
+    if [[ "${MODE}" == "add" ]]; then
+      airvpn_log "INFO" "Profile for interface ${ifname} already exists (${conn_name}); refreshed managed config copy and hardened NM metadata (WireGuard keys/peers in NM unchanged; use --mode replace to re-import)"
+      harden_profile "${existing}" "${ifname}"
+      run_or_echo nmcli connection modify uuid "${existing}" connection.id "${conn_name}"
+      return 0
+    fi
   fi
 
   if ((DRY_RUN)); then
@@ -174,16 +181,23 @@ import_one() {
   # shellcheck disable=SC2064
   trap "rm -rf '${tmpdir}'" RETURN
   # Import from managed copy
-  local import_out
   import_out="$(nmcli -t connection import type wireguard file "${dest}")"
   # Output like: Connection 'foo' (uuid) successfully added.
   imported_uuid="$(printf '%s\n' "${import_out}" | sed -nE "s/.*\\(([0-9a-fA-F-]{36})\\).*/\\1/p")"
   if [[ -z "${imported_uuid}" ]]; then
     # Fallback: look up by imported name (often the filename stem)
-    imported_uuid="$(nmcli -t -f UUID,NAME connection show | awk -F: -v n="${base%.conf}" '$2==n || $2==FILENAME {print $1}' FILENAME="${base}" | head -n1)"
+    while IFS= read -r line; do
+      airvpn_nmcli_split_terse "${line}"
+      ((${#AIRVPN_NM_FIELDS[@]} >= 2)) || continue
+      cand_uuid="${AIRVPN_NM_FIELDS[0]}"
+      cand_name="${AIRVPN_NM_FIELDS[1]}"
+      if [[ "${cand_name}" == "${base%.conf}" || "${cand_name}" == "${base}" ]]; then
+        imported_uuid="${cand_uuid}"
+        break
+      fi
+    done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null || true)
   fi
   if [[ -z "${imported_uuid}" ]]; then
-    # Last resort: most recently added wireguard connection matching ifname after modify attempt
     airvpn_die "Failed to determine UUID after importing ${base}"
   fi
 

@@ -11,11 +11,12 @@
 - name: Include runtime script installation tasks
   ansible.builtin.import_tasks: scripts.yml
 
-- name: Include NetworkManager configuration tasks
-  ansible.builtin.import_tasks: networkmanager.yml
-
+# Firewall zones/policies must exist before airvpn-import runs airvpn-firewall-sync.
 - name: Include firewalld kill-switch tasks
   ansible.builtin.import_tasks: firewall.yml
+
+- name: Include NetworkManager configuration tasks
+  ansible.builtin.import_tasks: networkmanager.yml
 
 - name: Include verification tasks
   ansible.builtin.import_tasks: verify.yml

@@ -9,12 +9,22 @@
         | unique
       }}
 
+# python3-firewall has no dedicated CLI probe but is required by ansible.posix.firewalld.
+- name: Gather package facts for python3-firewall on Fedora Atomic
+  ansible.builtin.package_facts:
+    manager: auto
+
+- name: Add python3-firewall to Atomic missing packages when absent
+  ansible.builtin.set_fact:
+    airvpn_atomic_missing_packages: "{{ (airvpn_atomic_missing_packages + ['python3-firewall']) | unique }}"
+  when: "'python3-firewall' not in ansible_facts.packages"
+
 - name: Fail when required layered packages are missing on Fedora Atomic (default)
   ansible.builtin.fail:
     msg: |
       Fedora Atomic Desktop detected (/run/ostree-booted).
 
-      Missing required host command package(s): {{ airvpn_atomic_missing_packages | join(', ') }}
+      Missing required host package(s): {{ airvpn_atomic_missing_packages | join(', ') }}
 
       This project does not modify the host image with DNF.
       Layer the packages yourself, reboot, then re-run bootstrap:
@@ -23,6 +33,9 @@
         systemctl reboot
         # after reboot, from the repository:
         ./bootstrap.sh --config-source /path/to/airvpn-configs
+
+      Note: python3-firewall provides Python bindings required by
+      ansible.posix.firewalld and is checked even though it has no CLI command.
 
       To allow this role to request layering (still requires a reboot and a
       re-run), set airvpn_atomic_layer_missing_packages: true in config.yml.

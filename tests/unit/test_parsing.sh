@@ -96,6 +96,73 @@ filter_managed() {
 mapfile -t managed < <(printf '%s\n' "AirVPN - Test" "Other VPN" "AirVPN - Two" | filter_managed "${AIRVPN_CONNECTION_PREFIX}")
 [[ "${#managed[@]}" -eq 2 ]] && pass "managed profile filtering" || fail "managed profile filtering count=${#managed[@]}"
 
+# --- nmcli terse field splitting with escaped colons ---
+airvpn_nmcli_split_terse 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:My\:WiFi:802-11-wireless'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 3 &&
+  "${AIRVPN_NM_FIELDS[0]}" == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" &&
+  "${AIRVPN_NM_FIELDS[1]}" == "My:WiFi" &&
+  "${AIRVPN_NM_FIELDS[2]}" == "802-11-wireless" ]]; then
+  pass "nmcli terse unescape colon in name"
+else
+  fail "nmcli terse unescape colon in name (got ${AIRVPN_NM_FIELDS[*]-})"
+fi
+
+airvpn_nmcli_split_terse 'id:path\\with\\backslash:802-3-ethernet'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 3 &&
+  "${AIRVPN_NM_FIELDS[1]}" == 'path\with\backslash' ]]; then
+  pass "nmcli terse unescape backslash"
+else
+  fail "nmcli terse unescape backslash (got ${AIRVPN_NM_FIELDS[1]-})"
+fi
+
+airvpn_nmcli_split_terse 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:PlainName:802-11-wireless:wlan0:activated'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 5 &&
+  "${AIRVPN_NM_FIELDS[1]}" == "PlainName" &&
+  "${AIRVPN_NM_FIELDS[4]}" == "activated" ]]; then
+  pass "nmcli terse ordinary five-field line"
+else
+  fail "nmcli terse ordinary five-field line (got ${AIRVPN_NM_FIELDS[*]-})"
+fi
+
+airvpn_nmcli_split_terse 'uuid:Name\:with\:colons:802-3-ethernet:eth0:activated'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 5 &&
+  "${AIRVPN_NM_FIELDS[1]}" == "Name:with:colons" ]]; then
+  pass "nmcli terse escaped colon then more fields"
+else
+  fail "nmcli terse escaped colon then more fields (got ${AIRVPN_NM_FIELDS[*]-})"
+fi
+
+airvpn_nmcli_split_terse 'uuid::802-3-ethernet'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 3 && "${AIRVPN_NM_FIELDS[1]}" == "" ]]; then
+  pass "nmcli terse empty field"
+else
+  fail "nmcli terse empty field (got ${AIRVPN_NM_FIELDS[*]-})"
+fi
+
+# Trailing lone backslash: escape consumes nothing extra; field ends with no added char.
+airvpn_nmcli_split_terse 'uuid:name\'
+if [[ "${#AIRVPN_NM_FIELDS[@]}" -eq 2 && "${AIRVPN_NM_FIELDS[1]}" == "name" ]]; then
+  pass "nmcli terse malformed trailing escape"
+else
+  fail "nmcli terse malformed trailing escape (got ${AIRVPN_NM_FIELDS[*]-})"
+fi
+
+# UUID vs name targeting patterns used by protect-connection
+airvpn_nmcli_split_terse '11111111-2222-3333-4444-555555555555:MySSID'
+TARGET='11111111-2222-3333-4444-555555555555'
+matched=""
+if [[ "${AIRVPN_NM_FIELDS[0]}" == "${TARGET}" || "${AIRVPN_NM_FIELDS[1]}" == "${TARGET}" ]]; then
+  matched="${AIRVPN_NM_FIELDS[0]}"
+fi
+[[ "${matched}" == "${TARGET}" ]] && pass "nmcli terse UUID match" || fail "nmcli terse UUID match"
+
+TARGET='MySSID'
+matched=""
+if [[ "${AIRVPN_NM_FIELDS[0]}" == "${TARGET}" || "${AIRVPN_NM_FIELDS[1]}" == "${TARGET}" ]]; then
+  matched="${AIRVPN_NM_FIELDS[0]}"
+fi
+[[ "${matched}" == "11111111-2222-3333-4444-555555555555" ]] && pass "nmcli terse name match" || fail "nmcli terse name match"
+
 # --- Secret redaction ---
 redacted="$(printf 'PrivateKey = SUPERSECRETVALUE\nEndpoint = 192.0.2.10:1637\n' | airvpn_redact)"
 [[ "${redacted}" != *SUPERSECRETVALUE* ]] && pass "private key redacted" || fail "private key leaked in redact"

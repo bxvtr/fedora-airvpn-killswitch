@@ -9,6 +9,10 @@
   vars:
     airvpn_uninstall_confirmed: false
   tasks:
+    - name: Load airvpn_client role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/airvpn_client/defaults/main.yml"
+
     - name: Stat local config.yml
       ansible.builtin.stat:
         path: "{{ playbook_dir }}/../config.yml"
@@ -35,59 +39,83 @@
           restore direct Internet access on physical NetworkManager profiles.
 
     - name: Disconnect managed AirVPN profiles
-      ansible.builtin.shell:
-        cmd: |
-          set -Eeuo pipefail
-          prefix={{ airvpn_connection_prefix | quote }}
-          while IFS=: read -r uuid name state; do
-            [[ "${name}" == "${prefix}"* ]] || continue
-            [[ "${state}" == "activated" || "${state}" == "activating" ]] || continue
-            nmcli connection down uuid "${uuid}" || true
-          done < <(nmcli -t -f UUID,NAME,STATE connection show)
-      args:
-        executable: /bin/bash
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            prefix={{ airvpn_connection_prefix | to_json }}
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              name="${AIRVPN_NM_FIELDS[1]-}"
+              state="${AIRVPN_NM_FIELDS[2]-}"
+              [[ -n "${uuid}" ]] || continue
+              [[ "${name}" == "${prefix}"* ]] || continue
+              [[ "${state}" == "activated" || "${state}" == "activating" ]] || continue
+              nmcli connection down uuid "${uuid}" || true
+            done < <(nmcli -t -f UUID,NAME,STATE connection show 2>/dev/null || true)
+      register: airvpn_disconnect
       changed_when: true
+      # Templating of ${#...} is avoided by using ${VAR-} defaults instead of length checks.
 
     - name: Remove managed AirVPN NetworkManager profiles
-      ansible.builtin.shell:
-        cmd: |
-          set -Eeuo pipefail
-          prefix={{ airvpn_connection_prefix | quote }}
-          changed=0
-          while IFS=: read -r uuid name; do
-            [[ "${name}" == "${prefix}"* ]] || continue
-            nmcli connection delete uuid "${uuid}"
-            changed=1
-          done < <(nmcli -t -f UUID,NAME connection show)
-          exit "${changed}"
-      args:
-        executable: /bin/bash
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            prefix={{ airvpn_connection_prefix | to_json }}
+            changed=0
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              name="${AIRVPN_NM_FIELDS[1]-}"
+              [[ -n "${uuid}" ]] || continue
+              [[ "${name}" == "${prefix}"* ]] || continue
+              nmcli connection delete uuid "${uuid}"
+              changed=1
+            done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null || true)
+            exit "${changed}"
       register: airvpn_rm_profiles
       changed_when: airvpn_rm_profiles.rc == 1
       failed_when: airvpn_rm_profiles.rc > 1
       when: airvpn_uninstall_remove_profiles | bool
 
     - name: Restore physical profiles to restore zone
-      ansible.builtin.shell:
-        cmd: |
-          set -Eeuo pipefail
-          underlay={{ airvpn_underlay_zone | quote }}
-          restore={{ airvpn_restore_zone | quote }}
-          changed=0
-          while IFS=: read -r uuid name ctype; do
-            case "${ctype}" in
-              802-11-wireless|802-3-ethernet) ;;
-              *) continue ;;
-            esac
-            zone="$(nmcli -g connection.zone connection show "${uuid}" || true)"
-            if [[ "${zone}" == "${underlay}" ]]; then
-              nmcli connection modify uuid "${uuid}" connection.zone "${restore}"
-              changed=1
-            fi
-          done < <(nmcli -t -f UUID,NAME,TYPE connection show)
-          exit "${changed}"
-      args:
-        executable: /bin/bash
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            underlay={{ airvpn_underlay_zone | to_json }}
+            restore={{ airvpn_restore_zone | to_json }}
+            changed=0
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              ctype="${AIRVPN_NM_FIELDS[2]-}"
+              [[ -n "${uuid}" ]] || continue
+              case "${ctype}" in
+                802-11-wireless|802-3-ethernet) ;;
+                *) continue ;;
+              esac
+              zone="$(nmcli -g connection.zone connection show "${uuid}" || true)"
+              if [[ "${zone}" == "${underlay}" ]]; then
+                nmcli connection modify uuid "${uuid}" connection.zone "${restore}"
+                changed=1
+              fi
+            done < <(nmcli -t -f UUID,NAME,TYPE connection show 2>/dev/null || true)
+            exit "${changed}"
       register: airvpn_restore_zones
       changed_when: airvpn_restore_zones.rc == 1
       failed_when: airvpn_restore_zones.rc > 1
@@ -133,7 +161,11 @@
         {{
           (airvpn_runtime_scripts | map('regex_replace', '^(.*)$', airvpn_bin_dir ~ '/\1') | list)
           + (airvpn_runtime_scripts | map('regex_replace', '^(.*)$', airvpn_install_dir ~ '/\1') | list)
-          + [airvpn_install_dir ~ '/lib/airvpn-common.sh', airvpn_config_dir ~ '/airvpn-client.conf']
+          + [
+              airvpn_install_dir ~ '/lib/airvpn-common.sh',
+              airvpn_install_dir ~ '/lib/airvpn-select-physical-uuids.sh',
+              airvpn_config_dir ~ '/airvpn-client.conf'
+            ]
         }}
 
     - name: Remove install and state directories

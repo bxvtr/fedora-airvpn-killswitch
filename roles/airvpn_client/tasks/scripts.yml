@@ -11,7 +11,7 @@
     - { path: "{{ airvpn_managed_config_dir }}", mode: "0700" }
     - { path: "{{ airvpn_install_dir }}", mode: "0755" }
     - { path: "{{ airvpn_install_dir }}/lib", mode: "0755" }
-    - { path: "{{ airvpn_state_dir }}", mode: "0755" }
+    - { path: "{{ airvpn_state_dir }}", mode: "0700" }
     - { path: "{{ airvpn_bin_dir }}", mode: "0755" }
 
 - name: Install shared runtime library
@@ -21,6 +21,14 @@
     owner: root
     group: root
     mode: "0644"
+
+- name: Install physical UUID selection helper
+  ansible.builtin.copy:
+    src: lib/airvpn-select-physical-uuids.sh
+    dest: "{{ airvpn_install_dir }}/lib/airvpn-select-physical-uuids.sh"
+    owner: root
+    group: root
+    mode: "0755"
 
 - name: Install runtime helper scripts into libexec
   ansible.builtin.copy:
