@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# Import AirVPN WireGuard configurations into NetworkManager and sync firewall exceptions.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-import --source DIR [--mode add|replace] [--dry-run]
+
+Import AirVPN WireGuard .conf files into NetworkManager as managed profiles,
+harden them, and synchronize firewalld endpoint exceptions.
+
+  --source DIR   Directory containing AirVPN .conf files (required)
+  --mode MODE    add (default): import missing profiles only
+                 replace: remove project-managed profiles, then re-import
+  --dry-run      Show actions without changing the system
+  -h, --help     Show this help
+
+SECURITY: AirVPN .conf files contain private keys. They are copied only to a
+root-owned directory outside Git. Private keys are never printed.
+EOF
+}
+
+MODE="add"
+SOURCE=""
+DRY_RUN=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --source)
+      SOURCE="${2:-}"
+      shift 2
+      ;;
+    --mode)
+      MODE="${2:-}"
+      shift 2
+      ;;
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      airvpn_die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+[[ -n "${SOURCE}" ]] || {
+  usage
+  airvpn_die "--source is required"
+}
+[[ "${MODE}" == "add" || "${MODE}" == "replace" ]] || airvpn_die "--mode must be add or replace"
+
+airvpn_load_config
+airvpn_require_root
+airvpn_require_cmds nmcli wg firewall-cmd sha256sum install find flock
+airvpn_validate_source_dir "${SOURCE}"
+
+run_or_echo() {
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: %s\n' "$*"
+  else
+    "$@"
+  fi
+}
+
+label_from_filename() {
+  local base="$1"
+  base="${base%.conf}"
+  # Convert AirVPN_DE-Frankfurt_UDP-1637 -> DE-Frankfurt UDP-1637
+  base="${base#AirVPN_}"
+  base="${base//_/ }"
+  printf '%s' "${base}"
+}
+
+remove_managed_profiles() {
+  local uuid name _ctype _device _state
+  while IFS='|' read -r uuid name _ctype _device _state; do
+    [[ -n "${uuid}" ]] || continue
+    airvpn_log "INFO" "Removing managed profile: ${name}"
+    run_or_echo nmcli connection delete uuid "${uuid}"
+  done < <(airvpn_list_managed_connections)
+}
+
+# Returns 0 if a managed profile already uses this deterministic interface name.
+profile_exists_for_ifname() {
+  local want="$1"
+  local uuid name _ctype _device _state ifname
+  while IFS='|' read -r uuid name _ctype _device _state; do
+    ifname="$(nmcli -g connection.interface-name connection show "${uuid}" 2>/dev/null || true)"
+    if [[ "${ifname}" == "${want}" ]]; then
+      printf '%s' "${uuid}"
+      return 0
+    fi
+  done < <(airvpn_list_managed_connections)
+  return 1
+}
+
+harden_profile() {
+  local uuid="$1"
+  local ifname="$2"
+  run_or_echo nmcli connection modify uuid "${uuid}" \
+    connection.autoconnect no \
+    connection.zone "${AIRVPN_ZONE}" \
+    connection.interface-name "${ifname}" \
+    ipv4.dns-priority "${AIRVPN_DNS_PRIORITY}" \
+    ipv6.dns-priority "${AIRVPN_DNS_PRIORITY}" \
+    ipv4.dns-search '~.' \
+    ipv6.dns-search '~.' \
+    ipv4.never-default no \
+    ipv6.never-default no
+
+  if ! airvpn_is_truthy "${AIRVPN_ENABLE_IPV6}"; then
+    run_or_echo nmcli connection modify uuid "${uuid}" ipv6.method disabled
+  fi
+}
+
+import_one() {
+  local file="$1"
+  local base label conn_name endpoint pubkey ifname existing tmpdir imported_uuid
+  base="$(basename "${file}")"
+  label="$(label_from_filename "${base}")"
+  conn_name="${AIRVPN_CONNECTION_PREFIX}${label}"
+  endpoint="$(airvpn_wg_field "${file}" "Endpoint")"
+  pubkey="$(airvpn_wg_field "${file}" "PublicKey" || true)"
+  # Peer PublicKey is under [Peer]; Interface has PrivateKey. Prefer Peer PublicKey.
+  if [[ -z "${pubkey}" ]]; then
+    # Some parsers may need the peer key from the Peer section — already covered by field search.
+    airvpn_die "Missing PublicKey (peer) in ${base}"
+  fi
+
+  airvpn_parse_endpoint "${endpoint}"
+  local rc=$?
+  if ((rc == 2)); then
+    airvpn_die "Hostname Endpoint not supported (${base}). Export numeric IP configs from AirVPN."
+  fi
+  ((rc == 0)) || airvpn_die "Malformed Endpoint in ${base}"
+
+  ifname="$(airvpn_iface_name "${pubkey}" "${endpoint}")"
+
+  if existing="$(profile_exists_for_ifname "${ifname}")"; then
+    if [[ "${MODE}" == "add" ]]; then
+      airvpn_log "INFO" "Profile for interface ${ifname} already exists (${conn_name}); hardening only"
+      harden_profile "${existing}" "${ifname}"
+      run_or_echo nmcli connection modify uuid "${existing}" connection.id "${conn_name}"
+      return 0
+    fi
+  fi
+
+  # Copy to managed dir with safe permissions
+  run_or_echo install -d -m 0700 -o root -g root "${AIRVPN_MANAGED_CONFIG_DIR}"
+  local dest="${AIRVPN_MANAGED_CONFIG_DIR}/${base}"
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: install -m 0600 %s %s\n' "${file}" "${dest}"
+  else
+    install -m 0600 -o root -g root "${file}" "${dest}"
+  fi
+
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: nmcli connection import type wireguard file %s\n' "${dest}"
+    printf 'DRY-RUN: rename to %s, ifname %s, zone %s\n' "${conn_name}" "${ifname}" "${AIRVPN_ZONE}"
+    return 0
+  fi
+
+  tmpdir="$(mktemp -d)"
+  # shellcheck disable=SC2064
+  trap "rm -rf '${tmpdir}'" RETURN
+  # Import from managed copy
+  local import_out
+  import_out="$(nmcli -t connection import type wireguard file "${dest}")"
+  # Output like: Connection 'foo' (uuid) successfully added.
+  imported_uuid="$(printf '%s\n' "${import_out}" | sed -nE "s/.*\\(([0-9a-fA-F-]{36})\\).*/\\1/p")"
+  if [[ -z "${imported_uuid}" ]]; then
+    # Fallback: look up by imported name (often the filename stem)
+    imported_uuid="$(nmcli -t -f UUID,NAME connection show | awk -F: -v n="${base%.conf}" '$2==n || $2==FILENAME {print $1}' FILENAME="${base}" | head -n1)"
+  fi
+  if [[ -z "${imported_uuid}" ]]; then
+    # Last resort: most recently added wireguard connection matching ifname after modify attempt
+    airvpn_die "Failed to determine UUID after importing ${base}"
+  fi
+
+  nmcli connection modify uuid "${imported_uuid}" connection.id "${conn_name}"
+  harden_profile "${imported_uuid}" "${ifname}"
+  airvpn_log "INFO" "Imported ${conn_name} (uuid=${imported_uuid}, ifname=${ifname})"
+}
+
+main_import() {
+  if [[ "${MODE}" == "replace" ]]; then
+    remove_managed_profiles
+    if ((DRY_RUN == 0)); then
+      find "${AIRVPN_MANAGED_CONFIG_DIR}" -maxdepth 1 -type f -name '*.conf' -delete 2>/dev/null || true
+    fi
+  fi
+
+  local f
+  while IFS= read -r -d '' f; do
+    import_one "${f}"
+  done < <(find "${SOURCE}" -maxdepth 1 -type f -name '*.conf' -print0 | sort -z)
+
+  # Sync firewall endpoint exceptions via companion command
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: airvpn-firewall-sync\n'
+  else
+    if command -v airvpn-firewall-sync >/dev/null 2>&1; then
+      airvpn-firewall-sync
+    elif [[ -x "${SCRIPT_DIR}/airvpn-firewall-sync" ]]; then
+      "${SCRIPT_DIR}/airvpn-firewall-sync"
+    else
+      airvpn_log "WARN" "airvpn-firewall-sync not found; run it after install"
+    fi
+  fi
+
+  airvpn_log "INFO" "Import completed (mode=${MODE})"
+}
+
+airvpn_with_lock import main_import

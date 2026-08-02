@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# Show current AirVPN client and kill-switch status (never prints private keys).
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-status
+
+Report firewalld, NetworkManager, WireGuard, and DNS routing status for the
+project-managed AirVPN client. Private keys are never printed.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+airvpn_load_config
+airvpn_require_cmds nmcli firewall-cmd
+
+echo "=== airvpn-client status ==="
+
+# firewalld
+if systemctl is-active --quiet firewalld; then
+  echo "firewalld: active"
+else
+  echo "firewalld: INACTIVE"
+fi
+
+for pol in "${AIRVPN_POLICY_TO_VPN}" "${AIRVPN_POLICY_TO_UNDERLAY}"; do
+  if firewall-cmd --info-policy "${pol}" >/dev/null 2>&1; then
+    target="$(firewall-cmd --policy "${pol}" --get-target 2>/dev/null || echo unknown)"
+    echo "policy ${pol}: present (target=${target})"
+  else
+    echo "policy ${pol}: MISSING"
+  fi
+done
+
+for zone in "${AIRVPN_ZONE}" "${AIRVPN_UNDERLAY_ZONE}"; do
+  if firewall-cmd --info-zone="${zone}" >/dev/null 2>&1; then
+    echo "zone ${zone}: present"
+  else
+    echo "zone ${zone}: MISSING"
+  fi
+done
+
+echo
+echo "--- Physical connections ---"
+while IFS=: read -r uuid name ctype device state; do
+  [[ "${ctype}" == "802-11-wireless" || "${ctype}" == "802-3-ethernet" ]] || continue
+  zone="$(nmcli -g connection.zone connection show "${uuid}" 2>/dev/null || echo "")"
+  echo "physical: ${name} type=${ctype} state=${state} zone=${zone:-unset} device=${device:-none}"
+  if [[ "${state}" == "activated" && "${zone}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
+    echo "  WARNING: active physical connection is not in underlay zone ${AIRVPN_UNDERLAY_ZONE}"
+  fi
+done < <(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show)
+
+echo
+echo "--- Managed AirVPN profiles ---"
+active=0
+while IFS='|' read -r uuid name _ctype device state; do
+  echo "vpn: ${name} state=${state} device=${device:-none} uuid=${uuid}"
+  if [[ "${state}" == "activated" ]]; then
+    active=$((active + 1))
+    iface="$(nmcli -g connection.interface-name connection show "${uuid}" 2>/dev/null || true)"
+    endpoint="$(nmcli -g wireguard.peers connection show "${uuid}" 2>/dev/null | head -n1 || true)"
+    # Prefer Endpoint from managed conf if available
+    echo "  interface: ${iface:-unknown}"
+    if [[ -n "${iface}" ]] && command -v wg >/dev/null 2>&1; then
+      if age="$(airvpn_handshake_age_seconds "${iface}")"; then
+        echo "  handshake_age_seconds: ${age}"
+      else
+        echo "  handshake_age_seconds: unavailable"
+      fi
+      # Endpoint from wg show (no keys)
+      ep="$(wg show "${iface}" endpoints 2>/dev/null | awk '{print $2}' | head -n1 || true)"
+      echo "  endpoint: ${ep:-unknown}"
+    fi
+    : "${endpoint}"
+  fi
+done < <(airvpn_list_managed_connections)
+
+echo
+echo "active_managed_vpn_count: ${active}"
+if ((active == 1)); then
+  echo "active_managed_vpn: ok (exactly one)"
+elif ((active == 0)); then
+  echo "active_managed_vpn: none (kill switch should block direct Internet)"
+else
+  echo "active_managed_vpn: WARNING unexpected count ${active}"
+fi
+
+echo
+echo "--- DNS (systemd-resolved if available) ---"
+if command -v resolvectl >/dev/null 2>&1; then
+  resolvectl status 2>/dev/null | airvpn_redact | head -n 80 || true
+else
+  echo "resolvectl not available"
+fi

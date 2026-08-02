@@ -1,0 +1,66 @@
+---
+- name: Map missing commands to package names on Fedora Atomic
+  ansible.builtin.set_fact:
+    airvpn_atomic_missing_packages: >-
+      {{
+        airvpn_missing_commands
+        | map(attribute='package')
+        | list
+        | unique
+      }}
+
+- name: Fail when required layered packages are missing on Fedora Atomic (default)
+  ansible.builtin.fail:
+    msg: |
+      Fedora Atomic Desktop detected (/run/ostree-booted).
+
+      Missing required host command package(s): {{ airvpn_atomic_missing_packages | join(', ') }}
+
+      This project does not modify the host image with DNF.
+      Layer the packages yourself, reboot, then re-run bootstrap:
+
+        rpm-ostree install {{ airvpn_atomic_missing_packages | join(' ') }}
+        systemctl reboot
+        # after reboot, from the repository:
+        ./bootstrap.sh --config-source /path/to/airvpn-configs
+
+      To allow this role to request layering (still requires a reboot and a
+      re-run), set airvpn_atomic_layer_missing_packages: true in config.yml.
+  when:
+    - airvpn_atomic_missing_packages | length > 0
+    - not (airvpn_atomic_layer_missing_packages | bool)
+
+- name: Check whether missing packages are already staged via rpm-ostree
+  ansible.builtin.command:
+    cmd: rpm-ostree status --json
+  register: airvpn_rpm_ostree_status
+  changed_when: false
+  when:
+    - airvpn_atomic_missing_packages | length > 0
+    - airvpn_atomic_layer_missing_packages | bool
+
+- name: Request rpm-ostree layering for missing packages
+  ansible.builtin.command:
+    cmd: rpm-ostree install --idempotent {{ airvpn_atomic_missing_packages | join(' ') }}
+  register: airvpn_rpm_ostree_install
+  changed_when: >-
+    'No change.' not in (airvpn_rpm_ostree_install.stdout | default(''))
+    and airvpn_rpm_ostree_install.rc == 0
+  when:
+    - airvpn_atomic_missing_packages | length > 0
+    - airvpn_atomic_layer_missing_packages | bool
+
+- name: Stop after rpm-ostree layering so the user can reboot safely
+  ansible.builtin.fail:
+    msg: |
+      rpm-ostree package layering was requested for:
+        {{ airvpn_atomic_missing_packages | join(', ') }}
+
+      A reboot is required before the layered packages are available.
+      This role will not reboot the system automatically.
+
+      After reboot, re-run:
+        ./bootstrap.sh --config-source {{ airvpn_config_source }}
+  when:
+    - airvpn_atomic_missing_packages | length > 0
+    - airvpn_atomic_layer_missing_packages | bool

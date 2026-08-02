@@ -1,0 +1,63 @@
+---
+# Example configuration for fedora-airvpn-killswitch.
+# Copy this file to config.yml (gitignored) and adjust values.
+#
+# SECURITY WARNING:
+# AirVPN WireGuard .conf files contain private keys.
+# Never commit AirVPN configuration files or config.yml paths that point inside
+# this Git repository's tracked tree. Keep them outside the clone.
+
+# Required: absolute path to a directory containing AirVPN WireGuard .conf files.
+# The directory must be supplied by you; this project never downloads AirVPN configs.
+airvpn_config_source: "/absolute/path/to/your/airvpn-wireguard-configs"
+
+# NetworkManager connection name prefix for managed AirVPN profiles.
+airvpn_connection_prefix: "AirVPN - "
+
+# Persistent root-owned copy of imported configurations (mode 0700 / files 0600).
+airvpn_managed_config_dir: "/etc/airvpn-client/configs"
+
+# Install locations for project configuration and helper scripts.
+airvpn_config_dir: "/etc/airvpn-client"
+airvpn_install_dir: "/usr/local/libexec/airvpn-client"
+airvpn_bin_dir: "/usr/local/bin"
+
+# firewalld zone for managed AirVPN WireGuard interfaces.
+airvpn_zone: "airvpn"
+
+# firewalld zone for managed physical underlay (Wi-Fi / Ethernet) interfaces.
+airvpn_underlay_zone: "vpn-underlay"
+
+# firewalld policy objects (HOST -> zone).
+airvpn_policy_to_vpn: "airvpn-host-to-vpn"
+airvpn_policy_to_underlay: "airvpn-host-to-underlay"
+
+# Negative DNS priority so the active VPN profile wins over underlay DNS.
+airvpn_dns_priority: -100
+
+# Manage discovered Wi-Fi / Ethernet NetworkManager profiles.
+airvpn_manage_wifi_connections: true
+airvpn_manage_ethernet_connections: true
+
+# Optional explicit include/exclude lists (connection names or UUIDs).
+airvpn_physical_include: []
+airvpn_physical_exclude: []
+
+# Enable IPv6 handling in profiles and firewall exceptions.
+airvpn_enable_ipv6: true
+
+# Import strategy default used by bootstrap when not overridden on the CLI:
+# false = add missing managed profiles only
+# true  = replace all project-managed AirVPN profiles
+airvpn_replace_existing_profiles: false
+
+# Zone to restore physical profiles to during uninstall.
+airvpn_restore_zone: "public"
+
+# Fedora Atomic only: when true, attempt rpm-ostree layering of missing packages
+# and stop with a reboot required message. Default is fail with instructions.
+airvpn_atomic_layer_missing_packages: false
+
+# Uninstall options (used by playbooks/uninstall.yml).
+airvpn_uninstall_remove_profiles: true
+airvpn_uninstall_delete_configs: false

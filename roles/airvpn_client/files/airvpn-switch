@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Interactively switch between managed AirVPN NetworkManager profiles.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-switch
+
+Interactively select a managed AirVPN profile. The kill switch remains active
+for the entire operation. On failure, the system fails closed (no direct
+Internet via the underlay).
+
+Options include disconnecting all managed tunnels or cancelling.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+airvpn_load_config
+airvpn_require_root
+airvpn_require_cmds nmcli wg flock
+
+disconnect_all_managed() {
+  local uuid name _ctype device _state
+  while IFS='|' read -r uuid name _ctype device _state; do
+    airvpn_log "INFO" "Disconnecting ${name}"
+    nmcli connection down uuid "${uuid}" >/dev/null 2>&1 || true
+    airvpn_wait_inactive "${uuid}" 45 || airvpn_die "Timed out waiting for ${name} to deactivate"
+  done < <(airvpn_list_active_managed)
+}
+
+iface_for_uuid() {
+  local uuid="$1"
+  nmcli -g connection.interface-name connection show "${uuid}" 2>/dev/null || true
+}
+
+switch_main() {
+  mapfile -t rows < <(airvpn_list_managed_connections)
+  if ((${#rows[@]} == 0)); then
+    airvpn_die "No managed AirVPN profiles found. Run airvpn-import first."
+  fi
+
+  echo "Managed AirVPN profiles:"
+  local i=1
+  local uuid name _ctype device state
+  local -a uuids=()
+  local -a names=()
+  for row in "${rows[@]}"; do
+    IFS='|' read -r uuid name _ctype device state <<<"${row}"
+    uuids+=("${uuid}")
+    names+=("${name}")
+    printf '  %2d) %s  [%s]  device=%s\n' "${i}" "${name}" "${state}" "${device:-none}"
+    i=$((i + 1))
+  done
+  printf '  %2d) Disconnect all managed AirVPN tunnels\n' "${i}"
+  local disconnect_opt="${i}"
+  i=$((i + 1))
+  printf '  %2d) Cancel\n' "${i}"
+  local cancel_opt="${i}"
+
+  local choice
+  read -r -p "Select option: " choice
+  [[ "${choice}" =~ ^[0-9]+$ ]] || airvpn_die "Invalid selection"
+
+  if ((choice == cancel_opt)); then
+    airvpn_log "INFO" "Cancelled"
+    exit 0
+  fi
+
+  if ((choice == disconnect_opt)); then
+    disconnect_all_managed
+    airvpn_log "INFO" "All managed tunnels disconnected; kill switch still active"
+    exit 0
+  fi
+
+  if ((choice < 1 || choice > ${#uuids[@]})); then
+    airvpn_die "Selection out of range"
+  fi
+
+  local idx=$((choice - 1))
+  local target_uuid="${uuids[${idx}]}"
+  local target_name="${names[${idx}]}"
+
+  airvpn_log "INFO" "Fail-closed switch to: ${target_name}"
+  disconnect_all_managed
+
+  if ! nmcli connection up uuid "${target_uuid}"; then
+    airvpn_die "Activation failed for ${target_name}; direct Internet remains blocked by kill switch"
+  fi
+
+  airvpn_wait_active "${target_uuid}" 60 || airvpn_die "Timed out waiting for ${target_name} to activate"
+
+  local iface
+  iface="$(iface_for_uuid "${target_uuid}")"
+  [[ -n "${iface}" ]] || airvpn_die "No interface name for ${target_name}"
+
+  if ! airvpn_wait_handshake "${iface}" 180 60; then
+    airvpn_log "ERROR" "No recent WireGuard handshake on ${iface}; bringing tunnel down"
+    nmcli connection down uuid "${target_uuid}" >/dev/null 2>&1 || true
+    airvpn_die "Handshake verification failed; kill switch remains active"
+  fi
+
+  local active_count
+  active_count="$(airvpn_count_active_managed)"
+  if [[ "${active_count}" != "1" ]]; then
+    airvpn_die "Expected exactly one active managed VPN, found ${active_count}"
+  fi
+
+  airvpn_log "INFO" "Active: ${target_name} (iface=${iface})"
+}
+
+airvpn_with_lock switch switch_main

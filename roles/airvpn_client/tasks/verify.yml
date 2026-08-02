@@ -1,0 +1,10 @@
+---
+- name: Run offline verification via airvpn-check
+  ansible.builtin.command:
+    cmd: "{{ airvpn_bin_dir }}/airvpn-check --offline"
+  register: airvpn_verify_offline
+  changed_when: false
+
+- name: Show offline verification output
+  ansible.builtin.debug:
+    msg: "{{ airvpn_verify_offline.stdout_lines }}"

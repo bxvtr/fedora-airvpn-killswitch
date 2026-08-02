@@ -1,0 +1,48 @@
+---
+- name: Ensure project configuration directories exist
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ airvpn_config_dir }}", mode: "0755" }
+    - { path: "{{ airvpn_managed_config_dir }}", mode: "0700" }
+    - { path: "{{ airvpn_install_dir }}", mode: "0755" }
+    - { path: "{{ airvpn_install_dir }}/lib", mode: "0755" }
+    - { path: "{{ airvpn_state_dir }}", mode: "0755" }
+    - { path: "{{ airvpn_bin_dir }}", mode: "0755" }
+
+- name: Install shared runtime library
+  ansible.builtin.copy:
+    src: lib/airvpn-common.sh
+    dest: "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Install runtime helper scripts into libexec
+  ansible.builtin.copy:
+    src: "{{ item }}"
+    dest: "{{ airvpn_install_dir }}/{{ item }}"
+    owner: root
+    group: root
+    mode: "0755"
+  loop: "{{ airvpn_runtime_scripts }}"
+
+- name: Install wrapper symlinks into bin directory
+  ansible.builtin.file:
+    src: "{{ airvpn_install_dir }}/{{ item }}"
+    dest: "{{ airvpn_bin_dir }}/{{ item }}"
+    state: link
+    force: true
+  loop: "{{ airvpn_runtime_scripts }}"
+
+- name: Install airvpn-client.conf from template
+  ansible.builtin.template:
+    src: airvpn-client.conf.j2
+    dest: "{{ airvpn_config_dir }}/airvpn-client.conf"
+    owner: root
+    group: root
+    mode: "0644"

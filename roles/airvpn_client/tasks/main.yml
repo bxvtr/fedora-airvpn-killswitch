@@ -1,0 +1,21 @@
+---
+- name: Include validation tasks
+  ansible.builtin.import_tasks: validate.yml
+
+- name: Include platform detection tasks
+  ansible.builtin.import_tasks: detect.yml
+
+- name: Include dependency handling tasks
+  ansible.builtin.import_tasks: dependencies.yml
+
+- name: Include runtime script installation tasks
+  ansible.builtin.import_tasks: scripts.yml
+
+- name: Include NetworkManager configuration tasks
+  ansible.builtin.import_tasks: networkmanager.yml
+
+- name: Include firewalld kill-switch tasks
+  ansible.builtin.import_tasks: firewall.yml
+
+- name: Include verification tasks
+  ansible.builtin.import_tasks: verify.yml

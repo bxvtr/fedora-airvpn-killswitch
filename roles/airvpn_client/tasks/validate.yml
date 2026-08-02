@@ -1,0 +1,46 @@
+---
+- name: Require airvpn_config_source to be set
+  ansible.builtin.assert:
+    that:
+      - airvpn_config_source is string
+      - airvpn_config_source | length > 0
+    fail_msg: >-
+      airvpn_config_source must be set to an absolute directory containing your
+      AirVPN WireGuard .conf files. This project never downloads AirVPN configs.
+
+- name: Require airvpn_config_source to be absolute
+  ansible.builtin.assert:
+    that:
+      - airvpn_config_source is match('^/')
+    fail_msg: "airvpn_config_source must be an absolute path."
+
+- name: Stat AirVPN configuration source directory
+  ansible.builtin.stat:
+    path: "{{ airvpn_config_source }}"
+  register: airvpn_source_stat
+
+- name: Assert AirVPN configuration source directory exists
+  ansible.builtin.assert:
+    that:
+      - airvpn_source_stat.stat.exists
+      - airvpn_source_stat.stat.isdir
+    fail_msg: "airvpn_config_source does not exist or is not a directory: {{ airvpn_config_source }}"
+
+- name: Warn when AirVPN source directory appears world-readable
+  ansible.builtin.debug:
+    msg: >-
+      WARNING: {{ airvpn_config_source }} mode is {{ airvpn_source_stat.stat.mode }}.
+      Prefer mode 0700 because AirVPN .conf files contain private keys.
+  when: airvpn_source_stat.stat.mode[-1] | int >= 4
+
+- name: Validate naming variables are non-empty
+  ansible.builtin.assert:
+    that:
+      - airvpn_connection_prefix | length > 0
+      - airvpn_zone | length > 0
+      - airvpn_underlay_zone | length > 0
+      - airvpn_policy_to_vpn | length > 0
+      - airvpn_policy_to_underlay | length > 0
+      - airvpn_zone != airvpn_underlay_zone
+      - airvpn_policy_to_vpn != airvpn_policy_to_underlay
+    fail_msg: "Zone and policy names must be non-empty and distinct."

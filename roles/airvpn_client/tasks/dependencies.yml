@@ -1,0 +1,61 @@
+---
+- name: Probe required host commands
+  ansible.builtin.command:
+    cmd: bash -c 'command -v {{ item.command }}'
+  register: airvpn_cmd_probe
+  changed_when: false
+  failed_when: false
+  loop: "{{ airvpn_host_dependencies }}"
+  loop_control:
+    label: "{{ item.command }}"
+
+- name: Build missing command list
+  ansible.builtin.set_fact:
+    airvpn_missing_commands: >-
+      {{
+        airvpn_cmd_probe.results
+        | selectattr('rc', 'ne', 0)
+        | map(attribute='item')
+        | list
+      }}
+
+- name: Include package-based Fedora dependency tasks
+  ansible.builtin.include_tasks: dependencies_fedora.yml
+  when: not airvpn_is_atomic | bool
+
+- name: Include Fedora Atomic dependency tasks
+  ansible.builtin.include_tasks: dependencies_fedora_atomic.yml
+  when: airvpn_is_atomic | bool
+
+- name: Ensure required services are enabled and started
+  ansible.builtin.service:
+    name: "{{ item }}"
+    state: started
+    enabled: true
+  loop: "{{ airvpn_required_services }}"
+
+- name: Verify WireGuard kernel support is available
+  ansible.builtin.command:
+    cmd: modprobe -n wireguard
+  register: airvpn_wg_modprobe
+  changed_when: false
+  failed_when: false
+
+- name: Accept WireGuard built-in kernel support when modprobe probe fails
+  ansible.builtin.command:
+    cmd: >-
+      bash -c '[[ -d /sys/module/wireguard ]]
+      || [[ -e /lib/modules/$(uname -r)/kernel/drivers/net/wireguard/wireguard.ko* ]]
+      || [[ -e /usr/lib/modules/$(uname -r)/kernel/drivers/net/wireguard/wireguard.ko* ]]'
+  register: airvpn_wg_builtin
+  changed_when: false
+  failed_when: false
+  when: airvpn_wg_modprobe.rc != 0
+
+- name: Assert WireGuard kernel support
+  ansible.builtin.assert:
+    that:
+      - (airvpn_wg_modprobe.rc | default(1)) == 0 or (airvpn_wg_builtin.rc | default(1)) == 0
+    fail_msg: >-
+      WireGuard kernel support was not detected. Install/enable the wireguard
+      kernel module before continuing.

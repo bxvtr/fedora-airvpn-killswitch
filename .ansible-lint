@@ -1,0 +1,13 @@
+---
+# ansible-lint configuration
+profile: production
+exclude_paths:
+  - .venv/
+  - .ansible/
+  - collections/
+  - tests/fixtures/
+skip_list:
+  # Public API and docs intentionally use airvpn_* (not airvpn_client_*).
+  - var-naming[no-role-prefix]
+warn_list:
+  - experimental

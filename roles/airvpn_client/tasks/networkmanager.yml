@@ -1,0 +1,95 @@
+---
+- name: List NetworkManager connections (machine-readable)
+  ansible.builtin.command:
+    cmd: nmcli -t -f UUID,NAME,TYPE connection show
+  register: airvpn_nm_connections
+  changed_when: false
+
+- name: Select physical connection UUIDs for underlay protection
+  ansible.builtin.set_fact:
+    airvpn_physical_uuids: >-
+      {{
+        airvpn_nm_connections.stdout_lines
+        | map('split', ':')
+        | selectattr('1', 'defined')
+        | selectattr('2', 'defined')
+        | selectattr(
+            '2', 'in',
+            (
+              (['802-11-wireless'] if airvpn_manage_wifi_connections else [])
+              + (['802-3-ethernet'] if airvpn_manage_ethernet_connections else [])
+            )
+          )
+        | rejectattr('1', 'in', airvpn_physical_exclude)
+        | rejectattr('0', 'in', airvpn_physical_exclude)
+        | map(attribute='0')
+        | list
+      }}
+
+- name: Restrict physical UUIDs to explicit include list when provided
+  ansible.builtin.set_fact:
+    airvpn_physical_uuids: >-
+      {{
+        airvpn_nm_connections.stdout_lines
+        | map('split', ':')
+        | selectattr('0', 'defined')
+        | selectattr('1', 'defined')
+        | selectattr('2', 'defined')
+        | selectattr(
+            '2', 'in',
+            (
+              (['802-11-wireless'] if airvpn_manage_wifi_connections else [])
+              + (['802-3-ethernet'] if airvpn_manage_ethernet_connections else [])
+            )
+          )
+        | selectattr('0', 'in', airvpn_physical_include)
+        | rejectattr('1', 'in', airvpn_physical_exclude)
+        | map(attribute='0')
+        | list
+        + (
+          airvpn_nm_connections.stdout_lines
+          | map('split', ':')
+          | selectattr('1', 'defined')
+          | selectattr('1', 'in', airvpn_physical_include)
+          | map(attribute='0')
+          | list
+        )
+        | unique
+      }}
+  when: airvpn_physical_include | length > 0
+
+- name: Query current zone for each physical connection
+  ansible.builtin.command:
+    cmd: nmcli -g connection.zone connection show {{ item }}
+  register: airvpn_physical_zones
+  changed_when: false
+  loop: "{{ airvpn_physical_uuids }}"
+  loop_control:
+    label: "{{ item }}"
+  when: airvpn_physical_uuids | length > 0
+
+- name: Assign physical NetworkManager profiles to underlay zone
+  ansible.builtin.command:
+    cmd: nmcli connection modify uuid {{ item.item }} connection.zone {{ airvpn_underlay_zone }}
+  loop: "{{ airvpn_physical_zones.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - airvpn_physical_uuids | length > 0
+    - (item.stdout | default('') | trim) != airvpn_underlay_zone
+  changed_when: true
+
+- name: Import AirVPN WireGuard profiles via airvpn-import
+  ansible.builtin.command:
+    argv:
+      - "{{ airvpn_bin_dir }}/airvpn-import"
+      - --source
+      - "{{ airvpn_config_source }}"
+      - --mode
+      - "{{ airvpn_replace_existing_profiles | ternary('replace', 'add') }}"
+  register: airvpn_import_result
+  changed_when: >-
+    ('Imported' in (airvpn_import_result.stderr | default('')))
+    or ('Imported' in (airvpn_import_result.stdout | default('')))
+    or ('Removing managed profile' in (airvpn_import_result.stderr | default('')))
+    or ('hardening only' in (airvpn_import_result.stderr | default('')))

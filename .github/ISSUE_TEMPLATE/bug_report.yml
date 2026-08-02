@@ -1,0 +1,61 @@
+---
+name: Bug report
+description: Report a bug in fedora-airvpn-killswitch
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Do **not** paste AirVPN `.conf` files, private keys,
+        or personal IP addresses into this report.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Clear description of the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal steps without secrets.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Fedora Workstation (package-based)
+        - Fedora Spin (package-based)
+        - Fedora Atomic Desktop
+        - Other / unknown
+    validations:
+      required: true
+  - type: input
+    id: fedora_version
+    attributes:
+      label: Fedora version
+      placeholder: "43"
+    validations:
+      required: true
+  - type: textarea
+    id: checks
+    attributes:
+      label: airvpn-check / airvpn-status output
+      description: Paste redacted command output only. Never include PrivateKey lines.
+    validations:
+      required: false

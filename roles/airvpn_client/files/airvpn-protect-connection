@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Assign a physical NetworkManager connection to the protected underlay zone.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-protect-connection <name-or-uuid>
+
+Validate that the NetworkManager connection is Wi-Fi or Ethernet, then assign
+it to the project underlay firewalld zone so the kill switch covers it.
+EOF
+}
+
+TARGET="${1:-}"
+if [[ -z "${TARGET}" || "${TARGET}" == "-h" || "${TARGET}" == "--help" ]]; then
+  usage
+  [[ -n "${TARGET}" ]] && exit 0
+  exit 2
+fi
+
+airvpn_load_config
+airvpn_require_root
+airvpn_require_cmds nmcli
+
+# Resolve UUID
+UUID="$(nmcli -t -f UUID,NAME connection show | awk -F: -v t="${TARGET}" '$1==t || $2==t {print $1; exit}')"
+[[ -n "${UUID}" ]] || airvpn_die "Connection not found: ${TARGET}"
+
+TYPE="$(nmcli -g connection.type connection show "${UUID}")"
+NAME="$(nmcli -g connection.id connection show "${UUID}")"
+
+case "${TYPE}" in
+  802-11-wireless | 802-3-ethernet) ;;
+  wireguard)
+    airvpn_die "Refusing to move WireGuard connection '${NAME}' into the underlay zone"
+    ;;
+  *)
+    airvpn_die "Unsupported connection type '${TYPE}' for '${NAME}'. Only Wi-Fi and Ethernet are supported."
+    ;;
+esac
+
+# Do not touch loopback or bridge-like types (already filtered by type).
+nmcli connection modify uuid "${UUID}" connection.zone "${AIRVPN_UNDERLAY_ZONE}"
+airvpn_log "INFO" "Protected '${NAME}' (${UUID}) -> zone ${AIRVPN_UNDERLAY_ZONE}"
+airvpn_log "INFO" "Re-activate the connection if it is currently up for the zone to apply immediately"

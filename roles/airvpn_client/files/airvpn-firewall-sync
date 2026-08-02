@@ -1,0 +1,164 @@
+#!/usr/bin/env bash
+# Synchronize firewalld underlay policy endpoint exceptions from managed configs.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-firewall-sync [--dry-run]
+
+Parse managed AirVPN WireGuard configurations and synchronize project-owned
+firewalld rich-rule endpoint exceptions on the underlay policy.
+
+Only numeric IPv4 and bracketed IPv6 endpoints are supported.
+Hostname endpoints are rejected.
+EOF
+}
+
+DRY_RUN=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      DRY_RUN=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) airvpn_die "Unknown argument: $1" ;;
+  esac
+done
+
+airvpn_load_config
+airvpn_require_root
+airvpn_require_cmds firewall-cmd flock find
+
+MARKER_PREFIX='airvpn-client-endpoint'
+
+desired_rules() {
+  local family ip port rule
+  while IFS='|' read -r family ip port; do
+    [[ -n "${family}" ]] || continue
+    rule="$(airvpn_endpoint_rich_rule "${family}" "${ip}" "${port}")"
+    # Append a comment-like suffix via destination description? firewalld rich
+    # rules do not support freeform comments; we track by exact rule text.
+    printf '%s\n' "${rule}"
+  done < <(airvpn_collect_endpoints_from_dir "${AIRVPN_MANAGED_CONFIG_DIR}")
+}
+
+current_policy_rules() {
+  firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --list-rich-rules 2>/dev/null || true
+}
+
+is_endpoint_rule() {
+  local rule="$1"
+  [[ "${rule}" == *'protocol="udp"'* && "${rule}" == *'destination address='* && "${rule}" == *'port port='* && "${rule}" == *'accept'* ]]
+}
+
+sync_main() {
+  if ! firewall-cmd --permanent --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" >/dev/null 2>&1; then
+    airvpn_die "Missing firewalld policy ${AIRVPN_POLICY_TO_UNDERLAY}; run the install playbook first"
+  fi
+
+  if [[ ! -d "${AIRVPN_MANAGED_CONFIG_DIR}" ]]; then
+    airvpn_die "Managed config directory missing: ${AIRVPN_MANAGED_CONFIG_DIR}"
+  fi
+
+  mapfile -t desired < <(desired_rules | sort -u)
+  mapfile -t current < <(current_policy_rules)
+
+  declare -A want=()
+  local r
+  for r in "${desired[@]}"; do
+    [[ -n "${r}" ]] || continue
+    want["${r}"]=1
+  done
+
+  local changed=0
+
+  # Remove obsolete project endpoint rules (UDP destination accept rules we manage)
+  for r in "${current[@]}"; do
+    [[ -n "${r}" ]] || continue
+    if is_endpoint_rule "${r}" && [[ -z "${want[${r}]+x}" ]]; then
+      airvpn_log "INFO" "Removing obsolete endpoint rule"
+      if ((DRY_RUN)); then
+        printf 'DRY-RUN: remove rich rule\n'
+      else
+        firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --remove-rich-rule="${r}" >/dev/null
+      fi
+      changed=1
+    fi
+  done
+
+  # Refresh current after removals
+  mapfile -t current < <(current_policy_rules)
+  declare -A have=()
+  for r in "${current[@]}"; do
+    [[ -n "${r}" ]] || continue
+    have["${r}"]=1
+  done
+
+  for r in "${desired[@]}"; do
+    [[ -n "${r}" ]] || continue
+    if [[ -z "${have[${r}]+x}" ]]; then
+      airvpn_log "INFO" "Adding endpoint exception"
+      if ((DRY_RUN)); then
+        printf 'DRY-RUN: add rich rule for endpoint\n'
+      else
+        firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null
+      fi
+      changed=1
+    fi
+  done
+
+  # Ensure baseline underlay allowances (DHCP / NDP) exist — idempotent adds
+  local baseline=(
+    'rule family="ipv4" service name="dhcp" accept'
+    'rule family="ipv6" service name="dhcpv6-client" accept'
+    'rule family="ipv6" icmp-type name="neighbour-solicitation" accept'
+    'rule family="ipv6" icmp-type name="neighbour-advertisement" accept'
+    'rule family="ipv6" icmp-type name="router-advertisement" accept'
+  )
+  mapfile -t current < <(current_policy_rules)
+  have=()
+  for r in "${current[@]}"; do
+    [[ -n "${r}" ]] || continue
+    have["${r}"]=1
+  done
+  for r in "${baseline[@]}"; do
+    if [[ -z "${have[${r}]+x}" ]]; then
+      airvpn_log "INFO" "Adding baseline underlay allowance"
+      if ((DRY_RUN)); then
+        printf 'DRY-RUN: add baseline rule\n'
+      else
+        firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null ||
+          airvpn_log "WARN" "Could not add baseline rule (service may be unavailable)"
+      fi
+      changed=1
+    fi
+  done
+
+  if ((changed == 0)); then
+    airvpn_log "INFO" "Firewall endpoint exceptions already in sync"
+    return 0
+  fi
+
+  if ((DRY_RUN)); then
+    printf 'DRY-RUN: would validate and reload firewalld\n'
+    return 0
+  fi
+
+  airvpn_firewall_check_config
+  firewall-cmd --reload >/dev/null
+  airvpn_log "INFO" "firewalld reloaded; kill switch policies remain active"
+}
+
+# Silence unused marker in case future versions embed comments
+: "${MARKER_PREFIX}"
+
+airvpn_with_lock firewall sync_main

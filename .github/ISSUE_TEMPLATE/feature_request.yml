@@ -1,0 +1,33 @@
+---
+name: Feature request
+description: Suggest an enhancement
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem statement
+      description: What limitation are you hitting?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+    validations:
+      required: false
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope awareness
+      options:
+        - label: I checked ROADMAP.md and this is not already listed (or I am refining a listed item).
+          required: false
+        - label: I understand version 1 focuses on direct-on-host Fedora execution.
+          required: true

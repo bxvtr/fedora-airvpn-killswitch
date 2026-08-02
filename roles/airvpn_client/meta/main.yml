@@ -1,0 +1,22 @@
+---
+galaxy_info:
+  role_name: airvpn_client
+  namespace: local
+  author: bxvtr
+  description: >
+    Configure AirVPN WireGuard via NetworkManager with a firewalld kill switch
+    on Fedora and Fedora Atomic Desktops.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Fedora
+      versions:
+        - all
+  galaxy_tags:
+    - networking
+    - vpn
+    - firewall
+    - fedora
+    - wireguard
+
+dependencies: []

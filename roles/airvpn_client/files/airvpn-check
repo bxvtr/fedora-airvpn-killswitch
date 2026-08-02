@@ -1,0 +1,267 @@
+#!/usr/bin/env bash
+# Verify installation and leak-prevention related state.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-check [--offline|--online]
+
+  --offline  Inspect configuration and fail-closed posture without requiring VPN
+  --online   Additionally verify the live tunnel (requires active managed VPN)
+
+Exit codes:
+  0  all checks passed
+  1  one or more checks failed
+  2  usage error
+EOF
+}
+
+MODE="offline"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --offline)
+      MODE="offline"
+      shift
+      ;;
+    --online)
+      MODE="online"
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage
+      exit 2
+      ;;
+  esac
+done
+
+airvpn_load_config
+
+FAILURES=0
+pass() { printf 'PASS: %s\n' "$*"; }
+fail() {
+  printf 'FAIL: %s\n' "$*"
+  FAILURES=$((FAILURES + 1))
+}
+warn() { printf 'WARN: %s\n' "$*"; }
+
+check_cmds() {
+  local cmd
+  for cmd in nmcli firewall-cmd wg systemctl; do
+    if command -v "${cmd}" >/dev/null 2>&1; then
+      pass "command ${cmd}"
+    else
+      fail "command ${cmd} missing"
+    fi
+  done
+}
+
+check_services() {
+  if systemctl is-active --quiet NetworkManager; then
+    pass "NetworkManager active"
+  else
+    fail "NetworkManager not active"
+  fi
+  if systemctl is-active --quiet firewalld; then
+    pass "firewalld active"
+  else
+    fail "firewalld not active"
+  fi
+}
+
+check_zones_policies() {
+  local z p
+  for z in "${AIRVPN_ZONE}" "${AIRVPN_UNDERLAY_ZONE}"; do
+    if firewall-cmd --permanent --info-zone="${z}" >/dev/null 2>&1; then
+      pass "zone ${z} present"
+    else
+      fail "zone ${z} missing"
+    fi
+  done
+  for p in "${AIRVPN_POLICY_TO_VPN}" "${AIRVPN_POLICY_TO_UNDERLAY}"; do
+    if firewall-cmd --permanent --info-policy "${p}" >/dev/null 2>&1; then
+      pass "policy ${p} present"
+    else
+      fail "policy ${p} missing"
+    fi
+  done
+
+  local target
+  target="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --get-target 2>/dev/null || true)"
+  if [[ "${target}" == "REJECT" || "${target}" == "DROP" || "${target}" == "%%REJECT%%" ]]; then
+    pass "underlay policy target is fail-closed (${target})"
+  else
+    fail "underlay policy target should be REJECT/DROP, got '${target}'"
+  fi
+
+  target="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_VPN}" --get-target 2>/dev/null || true)"
+  if [[ "${target}" == "ACCEPT" ]]; then
+    pass "vpn policy target is ACCEPT"
+  else
+    fail "vpn policy target should be ACCEPT, got '${target}'"
+  fi
+}
+
+check_endpoint_exceptions() {
+  if [[ ! -d "${AIRVPN_MANAGED_CONFIG_DIR}" ]]; then
+    fail "managed config dir missing"
+    return
+  fi
+  local count=0
+  local _line
+  while IFS= read -r _line; do
+    [[ -n "${_line}" ]] || continue
+    count=$((count + 1))
+  done < <(airvpn_collect_endpoints_from_dir "${AIRVPN_MANAGED_CONFIG_DIR}" 2>/dev/null || true)
+
+  if ((count == 0)); then
+    warn "no endpoints discovered in managed configs"
+  else
+    pass "discovered ${count} endpoint exception candidate(s)"
+  fi
+
+  local rules
+  rules="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --list-rich-rules 2>/dev/null || true)"
+  if grep -q 'protocol="udp"' <<<"${rules}"; then
+    pass "underlay policy has UDP endpoint rich rules"
+  else
+    fail "underlay policy has no UDP endpoint rich rules"
+  fi
+}
+
+check_profiles() {
+  local found=0
+  local uuid name _ctype _device state zone auto prio search
+  while IFS='|' read -r uuid name _ctype _device state; do
+    found=$((found + 1))
+    auto="$(nmcli -g connection.autoconnect connection show "${uuid}")"
+    zone="$(nmcli -g connection.zone connection show "${uuid}")"
+    prio="$(nmcli -g ipv4.dns-priority connection show "${uuid}")"
+    search="$(nmcli -g ipv4.dns-search connection show "${uuid}")"
+    if [[ "${auto}" == "no" || "${auto}" == "false" ]]; then
+      pass "profile ${name}: autoconnect disabled"
+    else
+      fail "profile ${name}: autoconnect should be disabled"
+    fi
+    if [[ "${zone}" == "${AIRVPN_ZONE}" ]]; then
+      pass "profile ${name}: zone ${zone}"
+    else
+      fail "profile ${name}: zone is '${zone}', expected ${AIRVPN_ZONE}"
+    fi
+    if [[ "${prio}" == "${AIRVPN_DNS_PRIORITY}" ]]; then
+      pass "profile ${name}: dns-priority ${prio}"
+    else
+      fail "profile ${name}: dns-priority '${prio}', expected ${AIRVPN_DNS_PRIORITY}"
+    fi
+    if [[ "${search}" == *'~.'* ]]; then
+      pass "profile ${name}: routing domain ~. present"
+    else
+      fail "profile ${name}: missing dns-search ~."
+    fi
+  done < <(airvpn_list_managed_connections)
+
+  if ((found == 0)); then
+    warn "no managed AirVPN profiles found"
+  fi
+}
+
+check_unsafe_physical() {
+  while IFS=: read -r uuid name ctype _device state; do
+    [[ "${ctype}" == "802-11-wireless" || "${ctype}" == "802-3-ethernet" ]] || continue
+    [[ "${state}" == "activated" ]] || continue
+    local zone
+    zone="$(nmcli -g connection.zone connection show "${uuid}")"
+    if [[ "${zone}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
+      fail "active physical connection '${name}' not in underlay zone (zone=${zone:-unset})"
+    else
+      pass "active physical '${name}' in underlay zone"
+    fi
+  done < <(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show)
+}
+
+check_active_count() {
+  local count
+  count="$(airvpn_count_active_managed)"
+  if [[ "${MODE}" == "online" ]]; then
+    if [[ "${count}" == "1" ]]; then
+      pass "exactly one managed VPN active"
+    else
+      fail "online mode requires exactly one managed VPN active (found ${count})"
+    fi
+  else
+    if ((count > 1)); then
+      fail "more than one managed VPN active (${count})"
+    else
+      pass "managed VPN active count=${count}"
+    fi
+  fi
+}
+
+check_online_tunnel() {
+  local row uuid name _ctype device _state iface age
+  row="$(airvpn_list_active_managed | head -n1 || true)"
+  [[ -n "${row}" ]] || {
+    fail "no active managed VPN"
+    return
+  }
+  IFS='|' read -r uuid name _ctype _device _state <<<"${row}"
+  iface="$(nmcli -g connection.interface-name connection show "${uuid}")"
+  if [[ -z "${iface}" ]]; then
+    fail "missing interface for ${name}"
+    return
+  fi
+  pass "active interface ${iface}"
+  if age="$(airvpn_handshake_age_seconds "${iface}")"; then
+    if ((age <= 180)); then
+      pass "recent handshake (${age}s)"
+    else
+      fail "stale handshake (${age}s)"
+    fi
+  else
+    fail "handshake unavailable on ${iface}"
+  fi
+
+  # Basic route presence via the tunnel interface
+  if ip -4 route show default | grep -q "${iface}"; then
+    pass "IPv4 default route via ${iface}"
+  else
+    fail "IPv4 default route not via ${iface}"
+  fi
+  if airvpn_is_truthy "${AIRVPN_ENABLE_IPV6}"; then
+    if ip -6 route show default | grep -q "${iface}"; then
+      pass "IPv6 default route via ${iface}"
+    else
+      warn "IPv6 default route not via ${iface} (server may be IPv4-only)"
+    fi
+  fi
+  : "${_ctype}" "${_device}" "${_state}"
+}
+
+echo "=== airvpn-check (${MODE}) ==="
+check_cmds
+check_services
+check_zones_policies
+check_endpoint_exceptions
+check_profiles
+check_unsafe_physical
+check_active_count
+if [[ "${MODE}" == "online" ]]; then
+  check_online_tunnel
+fi
+
+echo
+if ((FAILURES > 0)); then
+  echo "RESULT: FAILED (${FAILURES} failure(s))"
+  exit 1
+fi
+echo "RESULT: OK"
+exit 0
