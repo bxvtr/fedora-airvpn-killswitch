@@ -103,22 +103,84 @@ else
   fail "owned removal set unexpected: ${removals[*]-}"
 fi
 
-# First-run: empty owned file → no removals
+# Migration: empty owned file still removes project-shaped orphans on the policy
 : >"${tmpdir}/owned_empty"
-mapfile -t removals2 < <(airvpn_owned_rules_to_remove "${tmpdir}/desired" "${tmpdir}/owned_empty" "${tmpdir}/current")
-if [[ "${#removals2[@]}" -eq 0 ]]; then
-  pass "first-run empty owned file removes nothing"
+mapfile -t removals2 < <(airvpn_owned_rules_to_remove "${tmpdir}/desired" "${tmpdir}/owned_empty" "${tmpdir}/current" | sort)
+if [[ "${#removals2[@]}" -eq 1 && "${removals2[0]}" == "${good6}" ]]; then
+  pass "migration empty owned file still removes project-shaped orphans"
 else
-  fail "first-run should remove nothing"
+  fail "migration orphan removal unexpected: ${removals2[*]-}"
 fi
 
-# Corrupted owned entries ignored (not scheduled for firewall-cmd)
+# Missing owned file path behaves like empty for candidate seeding from current
+mapfile -t removals_missing < <(airvpn_owned_rules_to_remove "${tmpdir}/desired" "${tmpdir}/no-such-owned" "${tmpdir}/current" | sort)
+if [[ "${#removals_missing[@]}" -eq 1 && "${removals_missing[0]}" == "${good6}" ]]; then
+  pass "missing owned file still removes project-shaped orphans from policy"
+else
+  fail "missing owned file orphan removal unexpected: ${removals_missing[*]-}"
+fi
+
+# Admin non-project rule never scheduled even when owned is empty
+if printf '%s\n' "${removals2[@]}" | grep -Fqx "${admin}"; then
+  fail "admin non-project rule must not be removal candidate"
+else
+  pass "admin non-project rule not a removal candidate"
+fi
+
+# Corrupted owned entries ignored; live project-shaped orphan still removed
 printf '%s\n' 'not-a-rule' "${evil}" "${good6}" >"${tmpdir}/owned_corrupt"
 mapfile -t removals3 < <(airvpn_owned_rules_to_remove "${tmpdir}/desired" "${tmpdir}/owned_corrupt" "${tmpdir}/current" | sort)
 if [[ "${#removals3[@]}" -eq 1 && "${removals3[0]}" == "${good6}" ]]; then
   pass "corrupt owned lines ignored safely"
 else
   fail "corrupt owned handling unexpected: ${removals3[*]-}"
+fi
+
+# Owned obsolete rule still present on policy is removed even if also listed only in owned
+orphan4="$(airvpn_endpoint_rich_rule ipv4 198.51.100.10 1637)"
+printf '%s\n' "${good4}" >"${tmpdir}/desired2"
+printf '%s\n' "${orphan4}" >"${tmpdir}/owned2"
+{
+  printf '%s\n' "${good4}"
+  printf '%s\n' "${orphan4}"
+  printf '%s\n' "${admin}"
+} >"${tmpdir}/current2"
+mapfile -t removals4 < <(airvpn_owned_rules_to_remove "${tmpdir}/desired2" "${tmpdir}/owned2" "${tmpdir}/current2" | sort)
+if [[ "${#removals4[@]}" -eq 1 && "${removals4[0]}" == "${orphan4}" ]]; then
+  pass "owned-only tracking still removes present obsolete rule"
+else
+  fail "owned-only removal unexpected: ${removals4[*]-}"
+fi
+
+# Static check: remove_owned_rule must not ignore firewall-cmd failures
+if grep -A20 '^remove_owned_rule()' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" |
+  grep -q 'airvpn_die "Failed to remove'; then
+  pass "remove_owned_rule aborts when firewall-cmd remove fails"
+else
+  fail "remove_owned_rule must die on firewall-cmd remove failure"
+fi
+
+if grep -A20 '^add_endpoint_rule()' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" |
+  grep -q 'airvpn_die "Failed to add'; then
+  pass "add_endpoint_rule aborts when firewall-cmd add fails"
+else
+  fail "add_endpoint_rule must die on firewall-cmd add failure"
+fi
+
+if grep -n 'Removing obsolete project-owned endpoint rule' -A5 "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" |
+  grep -q 'remove_owned_rule'; then
+  pass "removal loop invokes remove_owned_rule before continuing"
+else
+  fail "removal loop missing remove_owned_rule"
+fi
+
+# write_owned_rules call must happen only after removal attempts in sync_main
+remove_line="$(awk '/^sync_main\(\)/{p=1} p && /Removing obsolete project-owned/{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
+write_line="$(awk '/^sync_main\(\)/{p=1} p && /^[[:space:]]*write_owned_rules /{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
+if [[ -n "${remove_line}" && -n "${write_line}" && "${remove_line}" -lt "${write_line}" ]]; then
+  pass "owned-rules file rewritten only after removal attempts"
+else
+  fail "owned-rules write ordering incorrect (remove=${remove_line-} write=${write_line-})"
 fi
 
 echo

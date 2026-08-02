@@ -18,9 +18,12 @@ Only numeric IPv4 and bracketed IPv6 endpoints are supported.
 Hostname endpoints are rejected.
 
 Project-owned endpoint rules are tracked in a state file so unrelated
-administrator UDP rich rules on the same policy are never removed.
-Only validated project-shaped rich rules are written to that state file
-or passed to firewall-cmd.
+administrator rich rules on the same policy are never removed.
+Removal candidates are the union of that state file and any currently
+present project-shaped endpoint rich rules (migration-safe when the state
+file is missing). Only validated project-shaped rich rules are written to
+the state file or passed to firewall-cmd. Failed removals abort before the
+owned-rules state file is rewritten so retries remain possible.
 EOF
 }
 
@@ -41,7 +44,7 @@ done
 
 airvpn_load_config
 airvpn_require_root
-airvpn_require_cmds firewall-cmd flock find install
+airvpn_require_cmds firewall-cmd flock find install mktemp
 
 # Marker used in the owned-rules state file header (not embedded in rich rules;
 # firewalld rich language has no freeform comment field).
@@ -96,30 +99,38 @@ write_owned_rules() {
 
 remove_owned_rule() {
   local r="$1"
+  local err
   if ! airvpn_validate_endpoint_rich_rule "${r}"; then
     airvpn_log "WARN" "Skipping remove of invalid owned-rule entry"
     return 0
   fi
   if ((DRY_RUN)); then
     printf 'DRY-RUN: remove owned rich rule\n'
-  else
-    firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --remove-rich-rule="${r}" >/dev/null
+    return 0
+  fi
+  # Keep stderr for diagnostics; do not update ownership tracking on failure.
+  if ! err="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --remove-rich-rule="${r}" 2>&1 >/dev/null)"; then
+    airvpn_die "Failed to remove project endpoint rich rule from policy ${AIRVPN_POLICY_TO_UNDERLAY}; ownership state left unchanged for retry. firewall-cmd: ${err}"
   fi
 }
 
 add_endpoint_rule() {
   local r="$1"
+  local err
   if ! airvpn_validate_endpoint_rich_rule "${r}"; then
     airvpn_die "Refusing to add non-project endpoint rich rule"
   fi
   if ((DRY_RUN)); then
     printf 'DRY-RUN: add rich rule for endpoint\n'
-  else
-    firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null
+    return 0
+  fi
+  if ! err="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" 2>&1 >/dev/null)"; then
+    airvpn_die "Failed to add project endpoint rich rule to policy ${AIRVPN_POLICY_TO_UNDERLAY}; ownership state left unchanged for retry. firewall-cmd: ${err}"
   fi
 }
 
 sync_main() {
+  local desired_tmp owned_tmp current_tmp
   if ! firewall-cmd --permanent --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" >/dev/null 2>&1; then
     airvpn_die "Missing firewalld policy ${AIRVPN_POLICY_TO_UNDERLAY}; run the install playbook first"
   fi
@@ -128,9 +139,18 @@ sync_main() {
     airvpn_die "Managed config directory missing: ${AIRVPN_MANAGED_CONFIG_DIR}"
   fi
 
-  mapfile -t desired < <(desired_rules | sort -u)
-  mapfile -t owned < <(read_owned_rules | sort -u)
-  mapfile -t current < <(current_policy_rules)
+  desired_tmp="$(mktemp)"
+  owned_tmp="$(mktemp)"
+  current_tmp="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '${desired_tmp}' '${owned_tmp}' '${current_tmp}'" EXIT
+
+  desired_rules | sort -u >"${desired_tmp}"
+  read_owned_rules | sort -u >"${owned_tmp}"
+  current_policy_rules >"${current_tmp}"
+
+  mapfile -t desired <"${desired_tmp}"
+  mapfile -t current <"${current_tmp}"
 
   declare -A want=()
   declare -A have=()
@@ -148,18 +168,16 @@ sync_main() {
   done
 
   local changed=0
+  local -a to_remove=()
+  mapfile -t to_remove < <(airvpn_owned_rules_to_remove "${desired_tmp}" "${owned_tmp}" "${current_tmp}" | sort -u)
 
-  # Remove only rules this project previously installed (owned state file).
-  # Never delete arbitrary UDP destination accept rules that admins may have added.
-  for r in "${owned[@]}"; do
+  # Remove obsolete project-shaped endpoint rules (state file ∪ live policy).
+  # Never delete non-project-shaped administrator rich rules.
+  for r in "${to_remove[@]+"${to_remove[@]}"}"; do
     [[ -n "${r}" ]] || continue
-    if [[ -z "${want[${r}]+x}" ]]; then
-      if [[ -n "${have[${r}]+x}" ]]; then
-        airvpn_log "INFO" "Removing obsolete project-owned endpoint rule"
-        remove_owned_rule "${r}"
-        changed=1
-      fi
-    fi
+    airvpn_log "INFO" "Removing obsolete project-owned endpoint rule"
+    remove_owned_rule "${r}"
+    changed=1
   done
 
   # Refresh current after removals
@@ -200,14 +218,19 @@ sync_main() {
       airvpn_log "INFO" "Adding baseline underlay allowance"
       if ((DRY_RUN)); then
         printf 'DRY-RUN: add baseline rule\n'
+        changed=1
       else
-        firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null ||
+        if firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null 2>&1; then
+          changed=1
+        else
           airvpn_log "WARN" "Could not add baseline rule (service may be unavailable)"
+        fi
       fi
-      changed=1
     fi
   done
 
+  # Rewrite ownership only after successful removals/adds above. On remove/add
+  # failure, remove_owned_rule/add_endpoint_rule abort via airvpn_die first.
   if ((DRY_RUN == 0)); then
     write_owned_rules "${new_owned[@]+"${new_owned[@]}"}"
   else
@@ -225,7 +248,9 @@ sync_main() {
   fi
 
   airvpn_firewall_check_config
-  firewall-cmd --reload >/dev/null
+  if ! firewall-cmd --reload >/dev/null; then
+    airvpn_die "firewall-cmd --reload failed after endpoint sync"
+  fi
   airvpn_log "INFO" "firewalld reloaded; kill switch policies remain active"
 }
 

@@ -453,17 +453,21 @@ airvpn_filter_owned_endpoint_rules() {
   done
 }
 
-# Compute owned rules that should be removed: in owned+present, not in desired.
-# Args via stdin are unused; pass three NUL-safe lists as arguments is awkward in
-# bash — callers set namerefs or use the helper below with arrays.
+# Compute endpoint rich rules that should be removed from the underlay policy.
+# Usage: airvpn_owned_rules_to_remove <desired_file> <owned_file> <current_file>
+#
+# Candidates are the union of:
+#   - validated entries from the owned state file, and
+#   - validated project-shaped rules currently present on the policy
+#     (covers migration when the state file is missing or incomplete).
+# Non-project-shaped UDP rules on the policy are never candidates.
+# Emits rules that are candidates, currently present, and no longer desired.
 airvpn_owned_rules_to_remove() {
-  # Usage: airvpn_owned_rules_to_remove <desired_file> <owned_file> <current_file>
-  # Prints rules that are project-owned, currently present, and no longer desired.
   local desired_file="$1"
   local owned_file="$2"
   local current_file="$3"
   local r
-  declare -A want=() have=()
+  declare -A want=() have=() candidates=()
   while IFS= read -r r || [[ -n "${r}" ]]; do
     [[ -n "${r}" ]] || continue
     airvpn_validate_endpoint_rich_rule "${r}" || continue
@@ -472,14 +476,24 @@ airvpn_owned_rules_to_remove() {
   while IFS= read -r r || [[ -n "${r}" ]]; do
     [[ -n "${r}" ]] || continue
     have["${r}"]=1
-  done <"${current_file}"
-  while IFS= read -r r || [[ -n "${r}" ]]; do
-    [[ -n "${r}" ]] || continue
-    airvpn_validate_endpoint_rich_rule "${r}" || continue
-    if [[ -z "${want[${r}]+x}" && -n "${have[${r}]+x}" ]]; then
-      printf '%s\n' "${r}"
+    if airvpn_validate_endpoint_rich_rule "${r}"; then
+      candidates["${r}"]=1
     fi
-  done <"${owned_file}"
+  done <"${current_file}"
+  if [[ -f "${owned_file}" ]]; then
+    while IFS= read -r r || [[ -n "${r}" ]]; do
+      [[ -n "${r}" ]] || continue
+      airvpn_validate_endpoint_rich_rule "${r}" || continue
+      candidates["${r}"]=1
+    done <"${owned_file}"
+  fi
+  if ((${#candidates[@]} > 0)); then
+    for r in "${!candidates[@]}"; do
+      if [[ -z "${want[${r}]+x}" && -n "${have[${r}]+x}" ]]; then
+        printf '%s\n' "${r}"
+      fi
+    done
+  fi
 }
 
 # Collect unique endpoints from managed config dir. Prints: family|ip|port

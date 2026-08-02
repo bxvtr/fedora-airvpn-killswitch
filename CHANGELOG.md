@@ -27,3 +27,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Use a single project-wide flock for mutating runtime commands, including `airvpn-protect-connection`.
 - Nested lock re-entry uses inherited lock FD only; `AIRVPN_LOCK_HELD` is not trusted.
 - Validate owned underlay rich rules before persisting or passing them to `firewall-cmd`.
+- Remove obsolete project-shaped underlay endpoint rules from the live policy even when the ownership state file is missing; abort before rewriting ownership if `firewall-cmd` remove/add fails.
