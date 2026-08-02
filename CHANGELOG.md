@@ -28,3 +28,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Nested lock re-entry uses inherited lock FD only; `AIRVPN_LOCK_HELD` is not trusted.
 - Validate owned underlay rich rules before persisting or passing them to `firewall-cmd`.
 - Remove obsolete project-shaped underlay endpoint rules from the live policy even when the ownership state file is missing; abort before rewriting ownership if `firewall-cmd` remove/add fails.
+- Persist a pending firewalld reload marker until `firewall-cmd --reload` succeeds so a later sync retries applying permanent endpoint changes to the running firewall.

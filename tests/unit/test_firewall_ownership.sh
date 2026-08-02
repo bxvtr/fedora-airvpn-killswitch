@@ -174,13 +174,28 @@ else
   fail "removal loop missing remove_owned_rule"
 fi
 
-# write_owned_rules call must happen only after removal attempts in sync_main
-remove_line="$(awk '/^sync_main\(\)/{p=1} p && /Removing obsolete project-owned/{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
-write_line="$(awk '/^sync_main\(\)/{p=1} p && /^[[:space:]]*write_owned_rules /{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
-if [[ -n "${remove_line}" && -n "${write_line}" && "${remove_line}" -lt "${write_line}" ]]; then
-  pass "owned-rules file rewritten only after removal attempts"
+# write_owned_rules after successful mutations must follow reload (not precede it)
+reload_line="$(awk '/^sync_main\(\)/{p=1} p && /firewall-cmd --reload/{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
+write_after_reload_line="$(awk '/^sync_main\(\)/{p=1} p && /firewall-cmd --reload/{r=1} r && /^[[:space:]]*write_owned_rules /{print NR; exit}' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync")"
+if [[ -n "${reload_line}" && -n "${write_after_reload_line}" && "${reload_line}" -lt "${write_after_reload_line}" ]]; then
+  pass "owned-rules rewritten only after successful reload path"
 else
-  fail "owned-rules write ordering incorrect (remove=${remove_line-} write=${write_line-})"
+  fail "owned-rules must be written after reload (reload=${reload_line-} write=${write_after_reload_line-})"
+fi
+
+if grep -q 'pending-firewalld-reload' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" &&
+  grep -q 'mark_pending_reload' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" &&
+  grep -q 'pending_reload_is_set' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync"; then
+  pass "pending firewalld reload marker is implemented"
+else
+  fail "pending firewalld reload marker missing"
+fi
+
+if grep -A15 'if ((changed == 0 && needs_reload == 0))' "${ROOT}/roles/airvpn_client/files/airvpn-firewall-sync" |
+  grep -q 'already in sync'; then
+  pass "already-in-sync path requires no pending reload"
+else
+  fail "already-in-sync path must require needs_reload == 0"
 fi
 
 echo

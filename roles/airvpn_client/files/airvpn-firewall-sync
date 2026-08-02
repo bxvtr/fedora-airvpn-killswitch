@@ -23,7 +23,9 @@ Removal candidates are the union of that state file and any currently
 present project-shaped endpoint rich rules (migration-safe when the state
 file is missing). Only validated project-shaped rich rules are written to
 the state file or passed to firewall-cmd. Failed removals abort before the
-owned-rules state file is rewritten so retries remain possible.
+owned-rules state file is rewritten so retries remain possible. A pending
+reload marker forces firewalld reload on the next run if a previous reload
+failed after permanent changes.
 EOF
 }
 
@@ -50,6 +52,7 @@ airvpn_require_cmds firewall-cmd flock find install mktemp
 # firewalld rich language has no freeform comment field).
 MARKER_PREFIX='airvpn-client-endpoint'
 OWNED_RULES_FILE="${AIRVPN_STATE_DIR}/owned-underlay-endpoint-rules"
+PENDING_RELOAD_FILE="${AIRVPN_STATE_DIR}/pending-firewalld-reload"
 
 desired_rules() {
   local family ip port rule
@@ -95,6 +98,25 @@ write_owned_rules() {
   install -d -m 0700 -o root -g root "${AIRVPN_STATE_DIR}"
   install -m 0600 -o root -g root "${tmp}" "${OWNED_RULES_FILE}"
   rm -f "${tmp}"
+}
+
+# Record that permanent firewalld changes still need an applied reload.
+# Cleared only after firewall-cmd --reload succeeds.
+mark_pending_reload() {
+  if ((DRY_RUN)); then
+    return 0
+  fi
+  install -d -m 0700 -o root -g root "${AIRVPN_STATE_DIR}"
+  : >"${PENDING_RELOAD_FILE}"
+  chmod 0600 "${PENDING_RELOAD_FILE}"
+}
+
+clear_pending_reload() {
+  rm -f "${PENDING_RELOAD_FILE}"
+}
+
+pending_reload_is_set() {
+  [[ -f "${PENDING_RELOAD_FILE}" ]]
 }
 
 remove_owned_rule() {
@@ -168,6 +190,12 @@ sync_main() {
   done
 
   local changed=0
+  local needs_reload=0
+  if pending_reload_is_set; then
+    needs_reload=1
+    airvpn_log "INFO" "Pending firewalld reload detected; will apply permanent policy to the running firewall"
+  fi
+
   local -a to_remove=()
   mapfile -t to_remove < <(airvpn_owned_rules_to_remove "${desired_tmp}" "${owned_tmp}" "${current_tmp}" | sort -u)
 
@@ -178,6 +206,7 @@ sync_main() {
     airvpn_log "INFO" "Removing obsolete project-owned endpoint rule"
     remove_owned_rule "${r}"
     changed=1
+    mark_pending_reload
   done
 
   # Refresh current after removals
@@ -196,6 +225,7 @@ sync_main() {
       airvpn_log "INFO" "Adding endpoint exception"
       add_endpoint_rule "${r}"
       changed=1
+      mark_pending_reload
     fi
   done
 
@@ -222,6 +252,7 @@ sync_main() {
       else
         if firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --add-rich-rule="${r}" >/dev/null 2>&1; then
           changed=1
+          mark_pending_reload
         else
           airvpn_log "WARN" "Could not add baseline rule (service may be unavailable)"
         fi
@@ -229,28 +260,33 @@ sync_main() {
     fi
   done
 
-  # Rewrite ownership only after successful removals/adds above. On remove/add
-  # failure, remove_owned_rule/add_endpoint_rule abort via airvpn_die first.
-  if ((DRY_RUN == 0)); then
-    write_owned_rules "${new_owned[@]+"${new_owned[@]}"}"
-  else
-    printf 'DRY-RUN: would update owned-rules state file (%s)\n' "${OWNED_RULES_FILE}"
-  fi
-
-  if ((changed == 0)); then
+  if ((changed == 0 && needs_reload == 0)); then
+    # Keep owned-rules file aligned when permanent policy already matches desired.
+    if ((DRY_RUN == 0)); then
+      write_owned_rules "${new_owned[@]+"${new_owned[@]}"}"
+    fi
     airvpn_log "INFO" "Firewall endpoint exceptions already in sync"
     return 0
   fi
 
   if ((DRY_RUN)); then
     printf 'DRY-RUN: would validate and reload firewalld\n'
+    printf 'DRY-RUN: would update owned-rules state file (%s)\n' "${OWNED_RULES_FILE}"
     return 0
+  fi
+
+  # Permanent changes (if any) are already marked pending. Reload before rewriting
+  # ownership so a failed reload still forces a retry on the next run.
+  if ((changed)); then
+    mark_pending_reload
   fi
 
   airvpn_firewall_check_config
   if ! firewall-cmd --reload >/dev/null; then
-    airvpn_die "firewall-cmd --reload failed after endpoint sync"
+    airvpn_die "firewall-cmd --reload failed after endpoint sync; permanent changes remain pending for retry"
   fi
+  clear_pending_reload
+  write_owned_rules "${new_owned[@]+"${new_owned[@]}"}"
   airvpn_log "INFO" "firewalld reloaded; kill switch policies remain active"
 }
 
