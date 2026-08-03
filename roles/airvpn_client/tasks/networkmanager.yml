@@ -13,9 +13,19 @@
   register: airvpn_physical_uuid_lines
   changed_when: false
 
+# Helper prints one nmcli UUID per line. Trim blanks, drop empty lines, then
+# order-preserving unique. Do not pass the length filter name to select/reject:
+# length is a filter, not a Jinja test (ansible-core 2.21: "No test named ...").
 - name: Set physical UUID fact
   ansible.builtin.set_fact:
-    airvpn_physical_uuids: "{{ airvpn_physical_uuid_lines.stdout_lines | select('length') | list | unique }}"
+    airvpn_physical_uuids: >-
+      {{
+        airvpn_physical_uuid_lines.stdout_lines
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
 
 - name: Query current zone for each physical connection
   ansible.builtin.command:

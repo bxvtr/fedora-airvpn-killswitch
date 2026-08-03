@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Build the physical NetworkManager UUID fact with Jinja tests compatible with
+  ansible-core 2.21 (`map('trim') | reject('equalto', '') | unique | list`)
+  instead of invalid `select('length')`.
 - Shorten default firewalld policy names to satisfy the 18-character
   `max_policy_name_len` limit on supported Fedora (`airvpn-host-vpn`,
   `airvpn-host-under`); reject overrides such as the former

@@ -416,6 +416,93 @@ else
   fail "networkmanager.yml missing runtime zone reapply"
 fi
 
+# ansible-core 2.21: select()/reject() take Jinja *tests*; length is a filter only.
+# Ignore comment-only mentions; fail on non-comment task expressions.
+if grep -R -n --include='*.yml' --include='*.yaml' -E "select\(['\"]length['\"]\)|reject\(['\"]length['\"]\)" \
+  "${ROOT}/roles" "${ROOT}/playbooks" 2>/dev/null | grep -vE '^[^=]+:[0-9]+:[[:space:]]*#' >/dev/null; then
+  fail "invalid select/reject('length') still present in Ansible YAML"
+else
+  pass "Ansible YAML has no select/reject('length') expressions"
+fi
+
+if grep -q "reject('equalto', '')" "${nm_yml}" &&
+  grep -q "map('trim')" "${nm_yml}" &&
+  grep -A12 'Set physical UUID fact' "${nm_yml}" | grep -q 'unique' &&
+  grep -A12 'Set physical UUID fact' "${nm_yml}" | grep -q 'airvpn_physical_uuid_lines.stdout_lines'; then
+  pass "physical UUID fact uses trim/reject/unique pipeline"
+else
+  fail "physical UUID fact expression missing compatible filters"
+fi
+
+# Mirror the Jinja pipeline in bash: trim, drop empty, first-seen unique (no sort).
+airvpn_uuid_pipeline() {
+  local line trimmed
+  declare -A seen=()
+  declare -a out=()
+  for line in "$@"; do
+    trimmed="${line#"${line%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+    [[ -n "${trimmed}" ]] || continue
+    [[ -z "${seen[${trimmed}]+x}" ]] || continue
+    seen["${trimmed}"]=1
+    out+=("${trimmed}")
+  done
+  if ((${#out[@]} > 0)); then
+    printf '%s\n' "${out[@]}"
+  fi
+}
+
+u1="11111111-1111-4111-8111-111111111111"
+u2="22222222-2222-4222-8222-222222222222"
+expect_uuid_case() {
+  local name="$1" expected="$2"
+  shift 2
+  local got
+  got="$(airvpn_uuid_pipeline "$@" | paste -sd, -)"
+  if [[ "${got}" == "${expected}" ]]; then
+    pass "UUID pipeline ${name}"
+  else
+    fail "UUID pipeline ${name}: got='${got}' expected='${expected}'"
+  fi
+}
+expect_uuid_case empty ""
+expect_uuid_case empty_str "" ""
+expect_uuid_case whitespace_only "" "   "
+expect_uuid_case one "${u1}" "${u1}"
+expect_uuid_case one_empty "${u1}" "${u1}" ""
+expect_uuid_case dup "${u1}" "${u1}" "${u1}"
+expect_uuid_case trim "${u1}" " ${u1} "
+expect_uuid_case two "${u1},${u2}" "${u1}" "${u2}"
+expect_uuid_case mixed "${u1},${u2}" "${u1}" "" "${u2}" "${u1}"
+
+# Selection task precedes fact; loops consume cleaned list and skip when empty.
+sel_line="$(grep -n 'Select physical connection UUIDs' "${nm_yml}" | head -n1 | cut -d: -f1)"
+fact_line="$(grep -n 'Set physical UUID fact' "${nm_yml}" | head -n1 | cut -d: -f1)"
+zone_line="$(grep -n 'Assign physical NetworkManager profiles to underlay zone' "${nm_yml}" | head -n1 | cut -d: -f1)"
+if [[ -n "${sel_line}" && -n "${fact_line}" && -n "${zone_line}" &&
+  "${sel_line}" -lt "${fact_line}" && "${fact_line}" -lt "${zone_line}" ]]; then
+  pass "physical UUID select → fact → zone assign order"
+else
+  fail "physical UUID task order incorrect (sel=${sel_line-} fact=${fact_line-} zone=${zone_line-})"
+fi
+if grep -A20 'Query current zone for each physical connection' "${nm_yml}" |
+  grep -q 'when: airvpn_physical_uuids | length > 0'; then
+  pass "physical zone query skips safely when UUID list empty"
+else
+  fail "physical zone query missing empty-list guard"
+fi
+
+# Helper contract: one UUID per stdout line; errors on stderr; no headings.
+helper="${ROOT}/roles/airvpn_client/files/lib/airvpn-select-physical-uuids.sh"
+if grep -q "printf '%s\\\\n' \"\${uuid}\"" "${helper}" &&
+  grep -q 'Unknown argument' "${helper}" &&
+  grep -q '>&2' "${helper}" &&
+  ! grep -qE 'printf.*(UUID|NAME|TYPE)' "${helper}"; then
+  pass "select-physical-uuids helper stdout contract is UUID lines only"
+else
+  fail "select-physical-uuids helper stdout contract unexpected"
+fi
+
 # Loop register aggregate .rc must not gate failure; assert over .results instead.
 if grep -A25 'Reapply underlay zone on active physical interfaces' "${nm_yml}" |
   grep -qE 'failed_when:[[:space:]]*airvpn_runtime_zone\.rc'; then
