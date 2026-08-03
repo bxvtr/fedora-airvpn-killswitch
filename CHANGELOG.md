@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Import WireGuard profiles through a private temporary file named
+  `<deterministic-ifname>.conf` so NetworkManager accepts long AirVPN
+  source basenames; keep the original basename on the managed copy.
 - Build the physical NetworkManager UUID fact with Jinja tests compatible with
   ansible-core 2.21 (`map('trim') | reject('equalto', '') | unique | list`)
   instead of invalid `select('length')`.

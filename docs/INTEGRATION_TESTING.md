@@ -67,6 +67,18 @@ each other and from zone names, and must be updated consistently (defaults,
 runtime conf, and uninstall). Invalid overrides fail in early validation before
 any firewalld mutation. Do not rename only one reference by hand.
 
+## WireGuard import filenames
+
+AirVPN `.conf` downloads often use long human-readable basenames that exceed the
+Linux interface-name limit (`IFNAMSIZ - 1` = 15). NetworkManager WireGuard
+import requires the file basename to be a valid interface name followed by
+`.conf`.
+
+`airvpn-import` keeps the original basename on the root-owned managed copy for
+endpoint discovery, and imports through a private temporary file named
+`<deterministic-ifname>.conf` (mode `0600` under a `0700` directory). Temporary
+key material is removed on success and failure. Source files are never renamed.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and
