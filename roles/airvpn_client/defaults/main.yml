@@ -12,8 +12,12 @@ airvpn_state_dir: "/var/lib/airvpn-client"
 
 airvpn_zone: "airvpn"
 airvpn_underlay_zone: "vpn-underlay"
-airvpn_policy_to_vpn: "airvpn-host-to-vpn"
-airvpn_policy_to_underlay: "airvpn-host-to-underlay"
+# firewalld policy names are limited by iptables chain length (currently 18 on
+# supported Fedora/firewalld). Keep defaults short and validate overrides early.
+airvpn_firewalld_policy_name_max: 18
+airvpn_firewalld_zone_name_max: 17
+airvpn_policy_to_vpn: "airvpn-host-vpn"
+airvpn_policy_to_underlay: "airvpn-host-under"
 airvpn_dns_priority: -100
 
 airvpn_manage_wifi_connections: true

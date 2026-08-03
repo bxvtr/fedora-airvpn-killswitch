@@ -1,4 +1,44 @@
 ---
+# Validate identifiers before any mutating install tasks. Runs after playbook
+# vars_files / config.yml overrides are loaded into the role.
+
+# firewalld policy names: alnum plus '_' and '-' only; max length follows
+# firewalld max_policy_name_len() (18 on supported Fedora). Reject '/' and
+# shell metacharacters. Zone names use the same charset with max 17.
+# Run before config-source checks so invalid overrides fail without mutation.
+- name: Validate firewalld zone and policy name constraints
+  ansible.builtin.assert:
+    that:
+      - airvpn_connection_prefix | length > 0
+      - airvpn_zone is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+      - airvpn_underlay_zone is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+      - airvpn_policy_to_vpn is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+      - airvpn_policy_to_underlay is match('^[A-Za-z0-9][A-Za-z0-9_-]*$')
+      - airvpn_zone | length > 0
+      - airvpn_underlay_zone | length > 0
+      - airvpn_policy_to_vpn | length > 0
+      - airvpn_policy_to_underlay | length > 0
+      - airvpn_zone | length <= (airvpn_firewalld_zone_name_max | int)
+      - airvpn_underlay_zone | length <= (airvpn_firewalld_zone_name_max | int)
+      - airvpn_policy_to_vpn | length <= (airvpn_firewalld_policy_name_max | int)
+      - airvpn_policy_to_underlay | length <= (airvpn_firewalld_policy_name_max | int)
+      - airvpn_zone != airvpn_underlay_zone
+      - airvpn_policy_to_vpn != airvpn_policy_to_underlay
+      - airvpn_policy_to_vpn != airvpn_zone
+      - airvpn_policy_to_vpn != airvpn_underlay_zone
+      - airvpn_policy_to_underlay != airvpn_zone
+      - airvpn_policy_to_underlay != airvpn_underlay_zone
+    fail_msg: >-
+      Invalid firewalld identifier override. Zone names must match
+      ^[A-Za-z0-9][A-Za-z0-9_-]*$ and be at most {{ airvpn_firewalld_zone_name_max }}
+      characters. Policy names must match the same pattern and be at most
+      {{ airvpn_firewalld_policy_name_max }} characters (firewalld iptables chain
+      limit on supported Fedora). Names must be non-empty, pairwise distinct,
+      and policies must not reuse zone names. Got zone={{ airvpn_zone }} ({{ airvpn_zone | length }}),
+      underlay_zone={{ airvpn_underlay_zone }} ({{ airvpn_underlay_zone | length }}),
+      policy_vpn={{ airvpn_policy_to_vpn }} ({{ airvpn_policy_to_vpn | length }}),
+      policy_underlay={{ airvpn_policy_to_underlay }} ({{ airvpn_policy_to_underlay | length }}).
+
 - name: Require airvpn_config_source to be set
   ansible.builtin.assert:
     that:
@@ -32,15 +72,3 @@
       WARNING: {{ airvpn_config_source }} mode is {{ airvpn_source_stat.stat.mode }}.
       Prefer mode 0700 because AirVPN .conf files contain private keys.
   when: airvpn_source_stat.stat.mode[-1] | int >= 4
-
-- name: Validate naming variables are non-empty
-  ansible.builtin.assert:
-    that:
-      - airvpn_connection_prefix | length > 0
-      - airvpn_zone | length > 0
-      - airvpn_underlay_zone | length > 0
-      - airvpn_policy_to_vpn | length > 0
-      - airvpn_policy_to_underlay | length > 0
-      - airvpn_zone != airvpn_underlay_zone
-      - airvpn_policy_to_vpn != airvpn_policy_to_underlay
-    fail_msg: "Zone and policy names must be non-empty and distinct."

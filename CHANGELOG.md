@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Shorten default firewalld policy names to satisfy the 18-character
+  `max_policy_name_len` limit on supported Fedora (`airvpn-host-vpn`,
+  `airvpn-host-under`); reject overrides such as the former
+  `airvpn-host-to-underlay` (23 characters) before firewalld mutation.
 - Run firewalld zone/policy setup before NetworkManager import so `airvpn-firewall-sync` does not fail on missing policies.
 - Load `airvpn_client` role defaults from `playbooks/uninstall.yml` so cleanup variables are defined.
 - Track project-owned underlay endpoint rich rules in a state file; do not delete unrelated UDP accept rules.

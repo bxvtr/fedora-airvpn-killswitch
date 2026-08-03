@@ -52,6 +52,21 @@ runtime configuration. Check mode remains advisory: it does not prove live
 firewalld enforcement. After a failed partial install in the VM, prefer
 restoring the snapshot.
 
+## Firewalld policy name limits
+
+Supported Fedora/firewalld builds limit policy object names to **18 characters**
+(`firewall.max_policy_name_len()`, derived from iptables chain length). Default
+project policies are:
+
+- `airvpn-host-vpn` (HOST → `airvpn`, target `ACCEPT`)
+- `airvpn-host-under` (HOST → `vpn-underlay`, target `REJECT`)
+
+Custom overrides via `config.yml` must use the same charset as firewalld
+(`[A-Za-z0-9_-]`, no `/`), stay within the length limit, remain distinct from
+each other and from zone names, and must be updated consistently (defaults,
+runtime conf, and uninstall). Invalid overrides fail in early validation before
+any firewalld mutation. Do not rename only one reference by hand.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and

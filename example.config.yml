@@ -29,8 +29,9 @@ airvpn_zone: "airvpn"
 airvpn_underlay_zone: "vpn-underlay"
 
 # firewalld policy objects (HOST -> zone).
-airvpn_policy_to_vpn: "airvpn-host-to-vpn"
-airvpn_policy_to_underlay: "airvpn-host-to-underlay"
+# Names must be <= 18 characters on supported Fedora/firewalld (iptables chain limit).
+airvpn_policy_to_vpn: "airvpn-host-vpn"
+airvpn_policy_to_underlay: "airvpn-host-under"
 
 # Negative DNS priority so the active VPN profile wins over underlay DNS.
 airvpn_dns_priority: -100

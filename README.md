@@ -179,10 +179,14 @@ Check mode is best-effort; some NetworkManager/firewalld operations are not full
 firewalld policy objects (not a parallel raw nftables ruleset):
 
 ```text
-HOST -> airvpn        ACCEPT
+HOST -> airvpn        ACCEPT   (policy name default: airvpn-host-vpn)
 HOST -> vpn-underlay  REJECT  (+ exact UDP endpoint exceptions, DHCP/NDP allowances)
+                       (policy name default: airvpn-host-under)
 ```
 
+Policy object names must be at most **18 characters** on supported Fedora/firewalld.
+Override `airvpn_policy_to_vpn` / `airvpn_policy_to_underlay` only with short
+`[A-Za-z0-9_-]` names; invalid overrides fail before firewalld changes.
 Managed AirVPN interfaces are placed in the `airvpn` zone. Managed physical interfaces are placed in `vpn-underlay`.
 
 `airvpn-killswitch disable` requires typing `DISABLE KILLSWITCH` (or `--force`) and warns that direct traffic may leak. It never stops firewalld globally.

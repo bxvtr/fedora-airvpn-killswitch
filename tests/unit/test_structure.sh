@@ -40,6 +40,7 @@ for var in airvpn_runtime_scripts airvpn_state_dir airvpn_install_dir airvpn_bin
   airvpn_config_dir airvpn_managed_config_dir airvpn_connection_prefix \
   airvpn_underlay_zone airvpn_restore_zone airvpn_zone \
   airvpn_policy_to_vpn airvpn_policy_to_underlay \
+  airvpn_firewalld_policy_name_max airvpn_firewalld_zone_name_max \
   airvpn_uninstall_remove_profiles airvpn_uninstall_delete_configs; do
   if grep -q "^${var}:" "${defaults}"; then
     pass "defaults define ${var}"
@@ -47,6 +48,135 @@ for var in airvpn_runtime_scripts airvpn_state_dir airvpn_install_dir airvpn_bin
     fail "defaults missing ${var}"
   fi
 done
+
+# Firewalld policy-name length constraint (max_policy_name_len == 18 on Fedora).
+vpn_pol="$(grep -E '^airvpn_policy_to_vpn:' "${defaults}" | head -n1 | sed -E 's/^[^:]+:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+under_pol="$(grep -E '^airvpn_policy_to_underlay:' "${defaults}" | head -n1 | sed -E 's/^[^:]+:[[:space:]]*"?([^"]*)"?[[:space:]]*$/\1/')"
+vpn_len=${#vpn_pol}
+under_len=${#under_pol}
+if [[ "${vpn_pol}" == "airvpn-host-vpn" && "${vpn_len}" -eq 15 && "${vpn_len}" -le 18 ]]; then
+  pass "default VPN policy name valid length ${vpn_len}: ${vpn_pol}"
+else
+  fail "default VPN policy name unexpected: '${vpn_pol}' len=${vpn_len}"
+fi
+if [[ "${under_pol}" == "airvpn-host-under" && "${under_len}" -eq 17 && "${under_len}" -le 18 ]]; then
+  pass "default underlay policy name valid length ${under_len}: ${under_pol}"
+else
+  fail "default underlay policy name unexpected: '${under_pol}' len=${under_len}"
+fi
+if [[ "${under_len}" -le 18 && "${vpn_len}" -le 18 && "${vpn_pol}" != "${under_pol}" ]]; then
+  pass "default policy names within 18-char limit and distinct"
+else
+  fail "default policy names violate length/distinct constraints"
+fi
+# Rejected historical default must not remain as the active default.
+if grep -q 'airvpn-host-to-underlay' "${defaults}" || grep -q 'airvpn-host-to-vpn' "${defaults}"; then
+  fail "obsolete overlong/at-limit policy defaults still present in role defaults"
+else
+  pass "obsolete airvpn-host-to-* policy defaults removed from role defaults"
+fi
+if grep -q 'airvpn-host-to-underlay' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh" ||
+  grep -q 'airvpn-host-to-vpn' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh"; then
+  fail "obsolete policy defaults still present in airvpn-common.sh"
+else
+  pass "airvpn-common.sh fallback policy defaults match short names"
+fi
+
+validate_yml="${ROOT}/roles/airvpn_client/tasks/validate.yml"
+if grep -q 'airvpn_firewalld_policy_name_max' "${validate_yml}" &&
+  grep -q 'Validate firewalld zone and policy name constraints' "${validate_yml}" &&
+  grep -qF '[A-Za-z0-9][A-Za-z0-9_-]*' "${validate_yml}"; then
+  # Ensure naming assert is the first task name in validate.yml
+  first_task="$(awk '/^- name:/{print; exit}' "${validate_yml}")"
+  if [[ "${first_task}" == *'Validate firewalld zone and policy name constraints'* ]]; then
+    pass "firewalld name validation runs first in validate.yml"
+  else
+    fail "firewalld name validation is not the first validate.yml task: ${first_task}"
+  fi
+else
+  fail "validate.yml missing firewalld identifier constraints"
+fi
+
+# Structural reject fixtures: overlong / bad charset must be described in tests via assert fields
+if grep -q 'airvpn_policy_to_underlay | length <=' "${validate_yml}" &&
+  grep -q 'airvpn_policy_to_vpn | length <=' "${validate_yml}"; then
+  pass "validate.yml enforces policy name max length"
+else
+  fail "validate.yml missing policy length asserts"
+fi
+
+# Confirm rejected 23-char name is only intentional in docs/changelog/tests, not as default.
+bad_default_hits="$(grep -R -n --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.ansible \
+  -e 'airvpn-host-to-underlay' "${ROOT}" || true)"
+if [[ -z "${bad_default_hits}" ]]; then
+  pass "rejected underlay policy literal absent from tree"
+elif printf '%s\n' "${bad_default_hits}" | grep -vE 'CHANGELOG\.md|docs/|tests/unit/test_structure\.sh|INTEGRATION_TESTING' >/dev/null; then
+  fail "unexpected airvpn-host-to-underlay references:\n${bad_default_hits}"
+else
+  pass "airvpn-host-to-underlay retained only in docs/changelog/tests"
+fi
+
+# Name validation must precede mutating role imports (scripts/firewall/nm).
+val_line="$(grep -n 'validate.yml' "${main_yml}" | head -n1 | cut -d: -f1)"
+scripts_line="$(grep -n 'scripts.yml' "${main_yml}" | head -n1 | cut -d: -f1)"
+if [[ -n "${val_line}" && -n "${scripts_line}" && -n "${fw_line}" &&
+  "${val_line}" -lt "${scripts_line}" && "${val_line}" -lt "${fw_line}" ]]; then
+  pass "validate.yml imported before scripts.yml and firewall.yml"
+else
+  fail "validate.yml must run before mutating role tasks (val=${val_line-} scripts=${scripts_line-} fw=${fw_line-})"
+fi
+
+# Structural charset constraints reject empty/whitespace/metachar via Ansible match.
+if grep -q "airvpn_policy_to_vpn is match" "${validate_yml}" &&
+  grep -q "airvpn_policy_to_underlay is match" "${validate_yml}" &&
+  grep -q 'airvpn_policy_to_vpn != airvpn_policy_to_underlay' "${validate_yml}" &&
+  grep -q 'airvpn_policy_to_underlay != airvpn_zone' "${validate_yml}"; then
+  pass "validate.yml rejects empty/whitespace/metachar and duplicate/ambiguous names"
+else
+  fail "validate.yml missing duplicate/charset policy asserts"
+fi
+
+# Defaults max constants match discovered firewalld limits.
+if grep -qE '^airvpn_firewalld_policy_name_max:[[:space:]]*18[[:space:]]*$' "${defaults}" &&
+  grep -qE '^airvpn_firewalld_zone_name_max:[[:space:]]*17[[:space:]]*$' "${defaults}"; then
+  pass "defaults encode firewalld policy max 18 and zone max 17"
+else
+  fail "defaults missing expected firewalld name length constants"
+fi
+
+# example.config.yml and conf template stay aligned with variables (not stale literals).
+if grep -q 'airvpn-host-vpn' "${ROOT}/example.config.yml" &&
+  grep -q 'airvpn-host-under' "${ROOT}/example.config.yml" &&
+  ! grep -q 'airvpn-host-to-' "${ROOT}/example.config.yml"; then
+  pass "example.config.yml uses short policy defaults"
+else
+  fail "example.config.yml policy defaults stale"
+fi
+if grep -q 'AIRVPN_POLICY_TO_VPN="{{ airvpn_policy_to_vpn }}"' \
+  "${ROOT}/roles/airvpn_client/templates/airvpn-client.conf.j2" &&
+  grep -q 'AIRVPN_POLICY_TO_UNDERLAY="{{ airvpn_policy_to_underlay }}"' \
+  "${ROOT}/roles/airvpn_client/templates/airvpn-client.conf.j2"; then
+  pass "runtime conf template uses policy variables"
+else
+  fail "airvpn-client.conf.j2 missing policy variable templates"
+fi
+
+# firewall.yml / uninstall use variables, not hard-coded policy literals.
+if ! grep -qE 'airvpn-host-(vpn|under|to-)' "${ROOT}/roles/airvpn_client/tasks/firewall.yml" &&
+  ! grep -qE 'airvpn-host-(vpn|under|to-)' "${uninstall}"; then
+  pass "firewall.yml and uninstall.yml use policy variables not literals"
+else
+  fail "hard-coded policy name literals found in firewall or uninstall tasks"
+fi
+
+# Uninstall deletes project policies before zones.
+pol_line="$(grep -n 'delete-policy\|Remove project firewalld policies' "${uninstall}" | head -n1 | cut -d: -f1)"
+zone_rm_line="$(grep -n 'Remove project firewalld zones if present' "${uninstall}" | head -n1 | cut -d: -f1)"
+if [[ -n "${pol_line}" && -n "${zone_rm_line}" && "${pol_line}" -lt "${zone_rm_line}" ]]; then
+  pass "uninstall removes policies before zones"
+else
+  fail "uninstall policy/zone order incorrect (pol=${pol_line-} zone=${zone_rm_line-})"
+fi
 
 # config.yml overrides still load after defaults in uninstall
 def_task="$(grep -n 'Load airvpn_client role defaults' "${uninstall}" | head -n1 | cut -d: -f1)"
