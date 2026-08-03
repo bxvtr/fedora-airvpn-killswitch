@@ -53,18 +53,25 @@ jobs:
         run: |
           set -Eeuo pipefail
           mapfile -t files < <(
-            find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools \
-              -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' \) \
-              | sort
+            find bootstrap.sh roles/airvpn_client/files tests/unit \
+              tests/integration/lib tools \
+              -type f \( \
+                -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \
+                -o -name 'validate-safe' -o -name 'check-agent-safety' \
+                -o -name 'integration-test-vm' \
+              \) | sort
           )
           shellcheck -x -S error "${files[@]}"
           # Guard: no workflow step may execute the live integration runner.
-          if grep -R -n -E '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+          if grep -R -n -E \
+            '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/integration-test-vm([[:space:]].*)?$' \
             .github/workflows 2>/dev/null; then
             echo "ERROR: live tools/integration-test-vm must not be executed from CI workflows" >&2
             exit 1
           fi
-          if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' tools/validate-safe; then
+          if grep -E -q \
+            '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+            tools/validate-safe; then
             echo "ERROR: tools/validate-safe must not execute tools/integration-test-vm" >&2
             exit 1
           fi
