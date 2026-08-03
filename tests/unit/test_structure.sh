@@ -213,6 +213,61 @@ else
   fail "airvpn-protect-connection missing runtime zone apply"
 fi
 
+# --- Ansible controller collection path (ansible.cfg + bootstrap agree) ---
+ansible_cfg="${ROOT}/ansible.cfg"
+if grep -E -q '^[[:space:]]*collections_path[[:space:]]*=' "${ansible_cfg}" &&
+  ! grep -E -q '^[[:space:]]*collections_paths[[:space:]]*=' "${ansible_cfg}"; then
+  pass "ansible.cfg uses singular collections_path ini key"
+else
+  fail "ansible.cfg must set collections_path (singular); plural key is ignored by ansible-core"
+fi
+
+cfg_collections_line="$(grep -E '^[[:space:]]*collections_path[[:space:]]*=' "${ansible_cfg}" | head -n1 || true)"
+cfg_first_path="$(sed -E 's/^[[:space:]]*collections_path[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/:.*//' <<<"${cfg_collections_line}")"
+if [[ "${cfg_first_path}" == ".ansible/collections" ]]; then
+  pass "ansible.cfg prefers repository-local .ansible/collections"
+else
+  fail "ansible.cfg first collections_path entry is '${cfg_first_path}', expected .ansible/collections"
+fi
+
+bootstrap="${ROOT}/bootstrap.sh"
+if grep -q 'COLLECTIONS_PATH="${ROOT_DIR}/.ansible/collections"' "${bootstrap}" &&
+  grep -q 'ansible-galaxy collection install -r .* -p "${COLLECTIONS_PATH}"' "${bootstrap}" &&
+  grep -q -- '--skip-playbook' "${bootstrap}"; then
+  pass "bootstrap installs collections under repo .ansible/collections and supports --skip-playbook"
+else
+  fail "bootstrap collection install path or --skip-playbook missing"
+fi
+
+# Relative cfg path and bootstrap absolute path must resolve to the same directory name.
+if [[ "${cfg_first_path}" == ".ansible/collections" ]] &&
+  grep -q 'ROOT_DIR}/.ansible/collections' "${bootstrap}"; then
+  pass "bootstrap install path matches ansible.cfg repository-local collections_path"
+else
+  fail "bootstrap and ansible.cfg collection locations disagree"
+fi
+
+if ! grep -E -q '^[[:space:]]*(export[[:space:]]+)?ANSIBLE_COLLECTIONS_PATH=' \
+  "${ROOT}/tools/integration-test-vm" "${ROOT}/tools/validate-safe" 2>/dev/null; then
+  pass "integration-test-vm and validate-safe do not export ANSIBLE_COLLECTIONS_PATH"
+else
+  fail "unexpected ANSIBLE_COLLECTIONS_PATH export in integration-test-vm or validate-safe"
+fi
+
+# Mentions for refusal/bash -n allowlists are fine; actual invocation is not.
+if grep -E -q '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+  "${ROOT}/.github/workflows/"*.yml 2>/dev/null; then
+  fail "CI workflows must not execute tools/integration-test-vm"
+else
+  pass "CI workflows do not execute live integration-test-vm"
+fi
+if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+  "${ROOT}/tools/validate-safe"; then
+  fail "validate-safe must not invoke tools/integration-test-vm"
+else
+  pass "validate-safe does not invoke live integration-test-vm"
+fi
+
 echo
 if ((FAILS > 0)); then
   echo "STRUCTURE TESTS FAILED: ${FAILS}"

@@ -37,7 +37,7 @@ jobs:
       - name: Install controller requirements
         run: pip install -r requirements-controller.txt
       - name: Install collections
-        run: ansible-galaxy collection install -r requirements.yml
+        run: ansible-galaxy collection install -r requirements.yml -p .ansible/collections
       - name: Run ansible-lint
         run: ansible-lint
 
