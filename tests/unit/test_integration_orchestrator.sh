@@ -238,7 +238,7 @@ fi
 
 # Live ansible invocations must force system Python (like bootstrap.sh)
 if grep -q 'ANSIBLE_PYTHON_INTERPRETER="/usr/bin/python3"' "${ROOT}/tools/integration-test-vm" &&
-  grep -q 'ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'ansible_python_interpreter=' "${ROOT}/tests/integration/lib/ansible-invoke.sh" &&
   grep -q 'run_ansible_capture' "${ROOT}/tools/integration-test-vm" &&
   grep -q 'sudo_firewall_cmd' "${ROOT}/tools/integration-test-vm" &&
   grep -q 'it_count_active_managed_from_terse' "${ROOT}/tools/integration-test-vm" &&
@@ -259,6 +259,126 @@ if grep -A5 'phase_switch()' "${ROOT}/tools/integration-test-vm" | grep -q 'SKIP
   fi
 else
   fail "phase_switch structure unexpected"
+fi
+
+# --- Ansible become password prompting (lifecycle vs syntax) ---
+# shellcheck source=../integration/lib/ansible-invoke.sh
+source "${ROOT}/tests/integration/lib/ansible-invoke.sh"
+
+if it_ansible_args_have_ask_become < <(it_ansible_lifecycle_args \
+  "${ROOT}/inventory/localhost.yml" \
+  /usr/bin/python3 \
+  "${ROOT}/playbooks/install.yml" \
+  --check --diff \
+  -e "airvpn_config_source=/tmp/dummy"); then
+  pass "lifecycle argv includes --ask-become-pass (check-mode extras)"
+else
+  fail "lifecycle argv missing --ask-become-pass"
+fi
+
+if it_ansible_args_have_ask_become < <(it_ansible_lifecycle_args \
+  "${ROOT}/inventory/localhost.yml" \
+  /usr/bin/python3 \
+  "${ROOT}/playbooks/install.yml" \
+  -e "airvpn_config_source=/tmp/dummy"); then
+  pass "install lifecycle argv includes --ask-become-pass"
+else
+  fail "install lifecycle argv missing --ask-become-pass"
+fi
+
+if it_ansible_args_have_ask_become < <(it_ansible_lifecycle_args \
+  "${ROOT}/inventory/localhost.yml" \
+  /usr/bin/python3 \
+  "${ROOT}/playbooks/uninstall.yml" \
+  -e "airvpn_uninstall_confirmed=true"); then
+  pass "uninstall lifecycle argv includes --ask-become-pass"
+else
+  fail "uninstall lifecycle argv missing --ask-become-pass"
+fi
+
+# Syntax-check path must not add become prompting.
+if grep -A20 'phase_ansible_syntax()' "${ROOT}/tools/integration-test-vm" |
+  grep -q -- '--ask-become-pass'; then
+  fail "syntax-check phase must not pass --ask-become-pass"
+else
+  pass "syntax-check phase does not request become password"
+fi
+if grep -A15 'run_capture "ansible-syntax' "${ROOT}/tools/integration-test-vm" |
+  grep -q -- '--syntax-check'; then
+  pass "syntax-check invocations remain --syntax-check"
+else
+  fail "syntax-check invocations missing"
+fi
+
+# Runner wiring: tee + /dev/tty + shared helper; no insecure password plumbing.
+if grep -q 'it_ansible_lifecycle_args\|ansible_lifecycle_args' "${ROOT}/tools/integration-test-vm" &&
+  grep -q -- '--ask-become-pass' "${ROOT}/tests/integration/lib/ansible-invoke.sh" &&
+  grep -q 'tee -a' "${ROOT}/tools/integration-test-vm" &&
+  grep -q '</dev/tty' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'require_ansible_become_tty' "${ROOT}/tools/integration-test-vm"; then
+  pass "runner uses lifecycle args, TTY stdin, and tee capture"
+else
+  fail "runner missing become-prompt wiring"
+fi
+
+unsafe=0
+for needle in 'sudo -S' 'ANSIBLE_BECOME_PASSWORD' 'ansible_become_password=' 'pexpect' 'expect -' 'read -s'; do
+  if grep -n -- "${needle}" "${ROOT}/tools/integration-test-vm" \
+    "${ROOT}/tests/integration/lib/ansible-invoke.sh" 2>/dev/null; then
+    unsafe=1
+  fi
+done
+if ((unsafe == 0)); then
+  pass "no insecure become-password plumbing in integration runner"
+else
+  fail "insecure become-password pattern found"
+fi
+
+# Fake ansible-playbook: verify argv contains ask-become-pass and exit status preserved through tee.
+fake_bin="$(mktemp)"
+fake_log="$(mktemp)"
+cat >"${fake_bin}" <<'EOF'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+printf 'fake-ansible'
+for a in "$@"; do
+  printf ' %s' "${a}"
+done
+printf '\n'
+has_ask=0
+for a in "$@"; do
+  if [[ "${a}" == "--ask-become-pass" ]]; then
+    has_ask=1
+  fi
+done
+if ((has_ask == 0)); then
+  echo "missing --ask-become-pass" >&2
+  exit 3
+fi
+# Become prompts use /dev/tty in real Ansible; we only assert argv + exit plumbing.
+echo "stdin_is_tty=$([ -t 0 ] && echo 1 || echo 0)"
+exit 7
+EOF
+chmod +x "${fake_bin}"
+set +e
+set -o pipefail
+"${fake_bin}" --ask-become-pass playbooks/install.yml -e x=1 </dev/null 2>&1 | tee "${fake_log}" >/dev/null
+fake_rc=${PIPESTATUS[0]}
+set +o pipefail
+set -e
+if [[ "${fake_rc}" -eq 7 ]] && grep -q -- '--ask-become-pass' "${fake_log}"; then
+  pass "fake ansible exit status preserved through tee capture pattern"
+else
+  fail "fake ansible tee plumbing unexpected rc=${fake_rc} log=$(cat "${fake_log}")"
+fi
+rm -f "${fake_bin}" "${fake_log}"
+
+# Conservative uncertainty flags after attempted install remain documented.
+if grep -q 'KILL_SWITCH_MAY_BE_ACTIVE=1' "${ROOT}/tools/integration-test-vm" &&
+  grep -A3 'phase_install()' "${ROOT}/tools/integration-test-vm" | grep -q 'KILL_SWITCH_MAY_BE_ACTIVE=1'; then
+  pass "install phase still sets kill_switch_may_be_active conservatively"
+else
+  fail "install phase uncertainty marker missing"
 fi
 
 echo

@@ -24,6 +24,24 @@ They do **not** prove:
 - Server-switch leak resistance
 - Install/uninstall lifecycle on a real Fedora host
 
+## Ansible become password prompting
+
+Live install, check-mode, idempotency, and uninstall playbooks use Ansible
+`become` (sudo). The integration runner adds `--ask-become-pass` so **Ansible**
+prompts on the interactive TTY. The runner does **not** read, store, export, or
+write the password to artifacts.
+
+Expect:
+
+- An interactive terminal (do not pipe stdin away from the TTY)
+- One Ansible become prompt **per** Ansible process (check mode, install,
+  idempotency, and uninstall may each ask again)
+- No password on the command line, in environment variables, or in files
+
+`--non-interactive` is incompatible with these lifecycle phases. A prior
+interactive `sudo` prompt from the runner does **not** replace Ansible's become
+prompt.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and

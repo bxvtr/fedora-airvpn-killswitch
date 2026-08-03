@@ -21,6 +21,8 @@ source "${LIB_DIR}/diagnostics.sh"
 source "${LIB_DIR}/network-probes.sh"
 # shellcheck source=../tests/integration/lib/assertions.sh
 source "${LIB_DIR}/assertions.sh"
+# shellcheck source=../tests/integration/lib/ansible-invoke.sh
+source "${LIB_DIR}/ansible-invoke.sh"
 # shellcheck source=../roles/airvpn_client/files/lib/airvpn-common.sh
 source "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh"
 
@@ -311,23 +313,62 @@ resolve_ansible() {
 
 # Match bootstrap.sh: force system Python so firewalld bindings resolve on the host.
 ansible_common_args() {
-  printf '%s\0' \
-    -i "${ROOT}/inventory/localhost.yml" \
-    -e "ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}"
+  it_ansible_common_args "${ROOT}/inventory/localhost.yml" "${ANSIBLE_PYTHON_INTERPRETER}"
+}
+
+# Lifecycle playbooks use become=sudo. Ansible must prompt on the TTY; this runner
+# never reads, stores, logs, or exports the become password.
+require_ansible_become_tty() {
+  if ((NON_INTERACTIVE)); then
+    die "Ansible lifecycle phases require interactive become prompting. Omit --non-interactive and run from a terminal."
+  fi
+  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
+    die "Ansible become password prompting requires a usable /dev/tty. Run from an interactive terminal without redirecting away the TTY."
+  fi
+}
+
+# Build argv for privilege-requiring lifecycle playbooks (null-delimited on stdout).
+ansible_lifecycle_args() {
+  # ansible_lifecycle_args playbook.yml [extra ansible args...]
+  local playbook="$1"
+  shift
+  it_ansible_lifecycle_args \
+    "${ROOT}/inventory/localhost.yml" \
+    "${ANSIBLE_PYTHON_INTERPRETER}" \
+    "${playbook}" \
+    "$@"
 }
 
 run_ansible_capture() {
   # run_ansible_capture logfile playbook.yml [extra ansible args...]
+  # For become-requiring lifecycle runs only (install/check/idempotency/uninstall).
+  # Syntax-check must keep using run_capture without --ask-become-pass.
   local logfile="$1"
   local playbook="$2"
   shift 2
   local -a args=()
-  local arg
+  local arg raw rc=0
+
+  require_ansible_become_tty
+
   while IFS= read -r -d '' arg; do
     args+=("${arg}")
-  done < <(ansible_common_args)
-  args+=("${playbook}" "$@")
-  run_capture "${logfile}" "${ANSIBLE_BIN}" "${args[@]}"
+  done < <(ansible_lifecycle_args "${playbook}" "$@")
+
+  raw="${ARTIFACT_DIR}/${logfile}.raw"
+  : >"${raw}"
+  log "Ansible may prompt for the BECOME (sudo) password. The password is handled by Ansible only; this runner does not read, store, or write it to artifacts."
+  set +e
+  # Keep stdin on the TTY; tee mirrors non-secret Ansible output to the terminal and a raw log.
+  # Do not use command substitution here: it hides prompts and can detach interactive become UX.
+  set -o pipefail
+  "${ANSIBLE_BIN}" "${args[@]}" </dev/tty 2>&1 | tee -a "${raw}"
+  rc=${PIPESTATUS[0]}
+  set +o pipefail
+  set -e
+  write_artifact "${logfile}" "$(cat "${raw}")"$'\n'"[exit=${rc}]"$'\n'
+  rm -f "${raw}"
+  return "${rc}"
 }
 
 reload_runtime_config() {
@@ -577,13 +618,12 @@ phase_ansible_syntax() {
   log "Running ansible-playbook --check --diff (advisory; does not prove live correctness)."
   log "Diff output is redacted when written to artifacts; secrets may still exist in memory."
   set +e
-  local out rc
-  out="$("${ANSIBLE_BIN}" --check --diff \
-    "${common[@]}" "${ROOT}/playbooks/install.yml" \
-    -e "airvpn_config_source=${CONFIG_SOURCE}" 2>&1)"
+  local rc=0
+  run_ansible_capture "ansible-check.log" "${ROOT}/playbooks/install.yml" \
+    --check --diff \
+    -e "airvpn_config_source=${CONFIG_SOURCE}"
   rc=$?
   set -e
-  write_artifact "ansible-check.log" "${out}"$'\n'"[exit=${rc} advisory]"$'\n'
   if ((rc == 0)); then
     phase_mark PASS "ansible-check-mode" "advisory"
   else
