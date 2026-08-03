@@ -125,6 +125,258 @@ echo $! >"${pidfile}"
 it_stop_probe_loop "${marker}" "${pidfile}" 5
 [[ ! -f "${marker}" && ! -f "${pidfile}" ]] && pass "probe loop stop cleans marker/pids" || fail "probe stop cleanup"
 
+# --- public IPv4 response evaluation ---
+[[ "$(it_evaluate_public_ipv4_response 0 $'203.0.113.9\n')" == "ok|203.0.113.9" ]] &&
+  pass "accept exact IPv4" || fail "exact IPv4"
+[[ "$(it_evaluate_public_ipv4_response 0 '')" == "fail|empty_body" ]] &&
+  pass "reject empty body" || fail "empty body"
+[[ "$(it_evaluate_public_ipv4_response 0 '999.1.1.1')" == "fail|invalid_ipv4" ]] &&
+  pass "reject octet >255" || fail "octet"
+[[ "$(it_evaluate_public_ipv4_response 0 'not.an.ip')" == "fail|invalid_ipv4" ]] &&
+  pass "reject malformed IPv4" || fail "malformed"
+[[ "$(it_evaluate_public_ipv4_response 0 '<html>1.2.3.4</html>')" == "fail|invalid_body" ]] &&
+  pass "reject HTML body" || fail "html"
+[[ "$(it_evaluate_public_ipv4_response 0 '2001:db8::1')" == "fail|invalid_ipv6" ]] &&
+  pass "reject IPv6 when IPv4 expected" || fail "ipv6"
+[[ "$(it_evaluate_public_ipv4_response 6 '')" == "fail|dns" ]] &&
+  pass "classify curl DNS failure" || fail "dns class"
+[[ "$(it_evaluate_public_ipv4_response 7 '')" == "fail|connect" ]] &&
+  pass "classify curl connect failure" || fail "connect class"
+[[ "$(it_evaluate_public_ipv4_response 28 '')" == "fail|timeout" ]] &&
+  pass "classify curl timeout" || fail "timeout class"
+[[ "$(it_evaluate_public_ipv4_response 35 '')" == "fail|tls" ]] &&
+  pass "classify curl TLS failure" || fail "tls class"
+[[ "$(it_evaluate_public_ipv4_response 22 '')" == "fail|http" ]] &&
+  pass "classify curl HTTP error" || fail "http class"
+
+[[ "$(it_aggregate_public_ip_failure_class 'dns dns dns')" == "dns_unavailable" ]] &&
+  pass "aggregate DNS" || fail "aggregate DNS"
+[[ "$(it_aggregate_public_ip_failure_class 'timeout connect timeout')" == "https_egress_unavailable" ]] &&
+  pass "aggregate HTTPS egress" || fail "aggregate HTTPS"
+[[ "$(it_aggregate_public_ip_failure_class 'invalid_ipv4 empty_body')" == "invalid_provider_responses" ]] &&
+  pass "aggregate invalid responses" || fail "aggregate invalid"
+[[ "$(it_aggregate_public_ip_failure_class 'timeout dns invalid_ipv4')" == "lookup_inconclusive" ]] &&
+  pass "aggregate mixed inconclusive" || fail "aggregate mixed"
+
+[[ "$(it_first_vpn_public_ip_failure_message '198.51.100.1' '198.51.100.1' 1 1 '')" == \
+  "VPN public IPv4 matches baseline (possible underlay leak)" ]] &&
+  pass "message baseline leak" || fail "message leak"
+[[ "$(it_first_vpn_public_ip_failure_message '' '1.1.1.1' 0 1 'lookup_inconclusive')" == \
+  "DNS resolution unavailable" ]] &&
+  pass "message DNS" || fail "message DNS"
+[[ "$(it_first_vpn_public_ip_failure_message '' '1.1.1.1' 1 0 'lookup_inconclusive')" == \
+  "generic IPv4 HTTPS egress unavailable" ]] &&
+  pass "message HTTPS" || fail "message HTTPS"
+[[ "$(it_first_vpn_public_ip_failure_message '' '1.1.1.1' 1 1 'invalid_provider_responses')" == \
+  "invalid public-IP provider responses" ]] &&
+  pass "message invalid providers" || fail "message invalid"
+[[ "$(it_first_vpn_public_ip_failure_message '' '1.1.1.1' 1 1 'lookup_inconclusive')" == \
+  "public IPv4 lookup inconclusive after retries" ]] &&
+  pass "message inconclusive" || fail "message inconclusive"
+
+# --- mocked public IPv4 lookup (no network) ---
+IT_PUBLIC_IP_MAX_ROUNDS=2
+IT_PUBLIC_IP_RETRY_DELAY_SEC=0
+IT_DEFAULT_IPV4_URLS=(
+  "https://provider-a.test/ip"
+  "https://provider-b.test/ip"
+)
+
+mock_call_n=0
+mock_curl_first_ok() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  printf '203.0.113.50' >"${body_file}"
+  return 0
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_first_ok
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -eq 0 && "${IT_LAST_PUBLIC_IP}" == "203.0.113.50" && "${mock_call_n}" -eq 1 && "${IT_LAST_PUBLIC_IP_STATUS}" == "success" ]] &&
+  pass "first provider returns valid IPv4" || fail "first provider ok calls=${mock_call_n} ip=${IT_LAST_PUBLIC_IP}"
+
+mock_curl_second_ok() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  if [[ "${url}" == *provider-a* ]]; then
+    return 28
+  fi
+  printf '198.51.100.20' >"${body_file}"
+  return 0
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_second_ok
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -eq 0 && "${IT_LAST_PUBLIC_IP}" == "198.51.100.20" && "${mock_call_n}" -eq 2 ]] &&
+  pass "second provider succeeds after first failure" || fail "second provider ip=${IT_LAST_PUBLIC_IP} calls=${mock_call_n}"
+
+mock_curl_all_timeout() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  : >"${body_file}"
+  return 28
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_all_timeout
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -ne 0 && -z "${IT_LAST_PUBLIC_IP}" && "${IT_LAST_PUBLIC_IP_FAILURE_CLASS}" == "https_egress_unavailable" && "${mock_call_n}" -eq 4 ]] &&
+  pass "all providers time out (bounded retries)" ||
+  fail "timeouts rc=${rc} class=${IT_LAST_PUBLIC_IP_FAILURE_CLASS} calls=${mock_call_n}"
+
+mock_curl_dns() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  : >"${body_file}"
+  return 6
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_dns
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -ne 0 && "${IT_LAST_PUBLIC_IP_FAILURE_CLASS}" == "dns_unavailable" ]] &&
+  pass "DNS-classified curl failure aggregates" || fail "dns agg=${IT_LAST_PUBLIC_IP_FAILURE_CLASS}"
+
+mock_curl_empty200() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  : >"${body_file}"
+  return 0
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_empty200
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -ne 0 && "${IT_LAST_PUBLIC_IP_FAILURE_CLASS}" == "invalid_provider_responses" ]] &&
+  pass "empty HTTP 200 bodies classified" || fail "empty class=${IT_LAST_PUBLIC_IP_FAILURE_CLASS}"
+
+mock_curl_html() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  printf '<html>nope</html>' >"${body_file}"
+  return 0
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_html
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -ne 0 && "${IT_LAST_PUBLIC_IP_DIAG}" != *'<html>'* && "${IT_LAST_PUBLIC_IP_DIAG}" == *body_bytes=* ]] &&
+  pass "diagnostics omit provider response bodies" || fail "diag leak=${IT_LAST_PUBLIC_IP_DIAG}"
+
+# Transient first round, success later
+mock_curl_transient() {
+  local url="$1" body_file="$2"
+  mock_call_n=$((mock_call_n + 1))
+  if ((mock_call_n <= 2)); then
+    return 28
+  fi
+  printf '203.0.113.77' >"${body_file}"
+  return 0
+}
+IT_MOCK_CURL_IPV4_GET=mock_curl_transient
+mock_call_n=0
+set +e
+it_lookup_public_ipv4 >/dev/null
+rc=$?
+set -e
+[[ "${rc}" -eq 0 && "${IT_LAST_PUBLIC_IP}" == "203.0.113.77" && "${mock_call_n}" -eq 3 && "${IT_LAST_PUBLIC_IP_ATTEMPTS}" -eq 3 ]] &&
+  pass "transient first round then success; stops after success" ||
+  fail "transient ip=${IT_LAST_PUBLIC_IP} calls=${mock_call_n} attempts=${IT_LAST_PUBLIC_IP_ATTEMPTS}"
+
+# Prove curl status is not erased by || true in evaluator path
+[[ "$(it_evaluate_public_ipv4_response 28 '')" == "fail|timeout" ]] &&
+  pass "curl status preserved into failure class" || fail "status erased"
+
+# Baseline comparison outcomes used by First-VPN
+rc=0
+it_public_ip_differs_from_baseline "86.106.84.151" "37.46.199.71" || rc=$?
+[[ "${rc}" -eq 0 ]] && pass "VPN IPv4 differs from baseline" || fail "diff live-like"
+rc=0
+it_public_ip_differs_from_baseline "37.46.199.71" "37.46.199.71" || rc=$?
+[[ "${rc}" -eq 1 ]] && pass "VPN IPv4 equals baseline" || fail "eq live-like"
+rc=0
+it_public_ip_differs_from_baseline "86.106.84.151" "" || rc=$?
+[[ "${rc}" -eq 2 ]] && pass "baseline unavailable but VPN IPv4 valid" || fail "baseline missing"
+
+# Artifact newline separation + probe fields in runner
+runner="${ROOT}/tools/integration-test-vm"
+if grep -q 'public_ip_probe_status' "${runner}" &&
+  grep -q 'public_ip_probe_failure_class' "${runner}" &&
+  grep -q 'generic_https_probe' "${runner}" &&
+  grep -q 'dns_probe=' "${runner}" &&
+  grep -q 'it_lookup_public_ipv4' "${runner}" &&
+  grep -q 'it_first_vpn_public_ip_failure_message' "${runner}" &&
+  grep -q 'Command substitution strips trailing newlines' "${runner}"; then
+  pass "runner records structured public-IP probe artifacts and newline fix"
+else
+  fail "runner missing public-IP probe artifact wiring"
+fi
+
+# Online-check still precedes public IP capture inside phase_first_vpn
+if awk '
+  /^phase_first_vpn\(\)/ { in_phase=1 }
+  in_phase && /^[a-zA-Z_][a-zA-Z0-9_]*\(\)/ && !/^phase_first_vpn\(\)/ { in_phase=0 }
+  in_phase && /capture_vpn_routing_diagnostics "first-vpn"/ { diag=NR }
+  in_phase && /sudo_capture "online-check.log" airvpn-check --online/ { online=NR }
+  in_phase && /^[[:space:]]*it_lookup_public_ipv4/ { lookup=NR }
+  END { exit !(diag && online && lookup && diag < online && online < lookup) }
+' "${runner}"; then
+  pass "first-vpn online-check ordering remains before public IP lookup"
+else
+  fail "first-vpn ordering broken"
+fi
+
+# --skip-uninstall must not alter First-VPN probe semantics
+if ! grep -A120 'phase_first_vpn()' "${runner}" | grep -q 'SKIP_UNINSTALL'; then
+  pass "skip-uninstall does not alter First-VPN probe semantics"
+else
+  fail "skip-uninstall unexpectedly referenced in phase_first_vpn"
+fi
+
+# Inconclusive external probe remains fail-closed in summary path
+it_report_reset
+it_phase_record PASS "install"
+it_phase_record FAIL "first-vpn" "public IPv4 lookup inconclusive after retries"
+it_exit_code_from_summary && fail "inconclusive probe must keep summary non-zero" ||
+  pass "summary remains nonzero on inconclusive external probe"
+
+# Successful probe retains PASS wording path
+if grep -A130 'phase_first_vpn()' "${runner}" | grep -q 'phase_mark PASS "${phase}" "ip='; then
+  pass "successful probe retains existing PASS behavior"
+else
+  fail "PASS path missing"
+fi
+
+# First-VPN must not capture public IP via $(lookup...) (would drop IT_LAST_* diagnostics)
+if grep -A80 'phase_first_vpn()' "${runner}" | grep -q 'FIRST_VPN_IPV4="$('; then
+  fail "first-vpn still uses command substitution for public IP lookup"
+else
+  pass "first-vpn preserves probe diagnostics outside command substitution"
+fi
+
+# Restore defaults for any later tests in this process
+unset IT_MOCK_CURL_IPV4_GET
+IT_PUBLIC_IP_MAX_ROUNDS=3
+IT_PUBLIC_IP_RETRY_DELAY_SEC=2
+IT_DEFAULT_IPV4_URLS=(
+  "https://ipv4.icanhazip.com"
+  "https://api.ipify.org"
+  "https://ifconfig.me/ip"
+)
+
 # --- baseline IP comparison ---
 rc=0
 it_public_ip_differs_from_baseline "203.0.113.10" "198.51.100.1" || rc=$?

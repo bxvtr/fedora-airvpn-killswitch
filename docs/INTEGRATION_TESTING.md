@@ -98,7 +98,11 @@ the active managed WireGuard interface. A handshake alone is not sufficient.
 
 The VM integration runner records `ip rule`, `ip route show table all`, and
 `ip route get` under `first-vpn-routing.txt` after activation. External public-IP
-comparison against the baseline remains an integration-test responsibility.
+comparison against the baseline remains an integration-test responsibility: the
+runner uses bounded multi-provider IPv4 probes with preserved curl status,
+strict IPv4 validation, and layered DNS / generic HTTPS classification so a
+transient provider outage is not mislabeled as a routing leak. An inconclusive
+lookup still fails the phase (egress not proven).
 
 ## Purpose of the live VM test
 

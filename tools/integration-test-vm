@@ -123,6 +123,10 @@ append_artifact() {
   local name="$1"
   local content="$2"
   local path="${ARTIFACT_DIR}/${name}"
+  # Command substitution strips trailing newlines; keep artifact records separated.
+  if [[ -n "${content}" && "${content}" != *$'\n' ]]; then
+    content="${content}"$'\n'
+  fi
   it_redact_text "${content}" >>"${path}"
 }
 
@@ -249,20 +253,35 @@ confirm_allow_non_vm() {
 
 lookup_public_ip() {
   local family="$1"
-  local -a urls=()
-  local url body
   if [[ "${family}" == "4" ]]; then
-    urls=("${IT_DEFAULT_IPV4_URLS[@]}")
-  else
-    urls=("${IT_DEFAULT_IPV6_URLS[@]}")
+    it_lookup_public_ipv4
+    return $?
   fi
+
+  # IPv6: bounded single-pass providers with exact validation (no || true status wipe).
+  local -a urls=("${IT_DEFAULT_IPV6_URLS[@]}")
+  local url body_file body curl_rc restore_errexit=0
+  body_file="$(mktemp)"
+  [[ $- == *e* ]] && restore_errexit=1
   for url in "${urls[@]}"; do
-    body="$(curl -"${family}" -fsS --max-time 5 "${url}" 2>/dev/null | tr -d '[:space:]' || true)"
-    if [[ -n "${body}" ]]; then
+    : >"${body_file}"
+    set +e
+    curl -6 -fsS \
+      --connect-timeout "${IT_PUBLIC_IP_CONNECT_TIMEOUT}" \
+      --max-time "${IT_PUBLIC_IP_MAX_TIME}" \
+      -o "${body_file}" \
+      "${url}"
+    curl_rc=$?
+    ((restore_errexit)) && set -e
+    body="$(it_trim "$(cat "${body_file}" 2>/dev/null || true)")"
+    if [[ "${curl_rc}" -eq 0 && -n "${body}" && "${body}" != *[[:space:]]* ]] &&
+      airvpn_valid_ipv6 "${body}"; then
+      rm -f -- "${body_file}"
       printf '%s\n' "${body}"
       return 0
     fi
   done
+  rm -f -- "${body_file}"
   return 1
 }
 
@@ -830,9 +849,34 @@ phase_first_vpn() {
     append_artifact "first-vpn.log" "online_check=PASS"$'\n'
   fi
 
+  # Layered egress probes for classification (mocked in unit tests via PATH overrides).
+  local dns_ok=0 https_ok=0
+  if probe_dns example.com; then
+    dns_ok=1
+  fi
+  if probe_public_http 4; then
+    https_ok=1
+  fi
+
   # Always attempt egress capture for artifacts, even when online-check failed.
-  FIRST_VPN_IPV4="$(lookup_public_ip 4 || true)"
+  # Do not capture via $(...); it_lookup_public_ipv4 must run in this shell so
+  # IT_LAST_PUBLIC_IP_* diagnostics remain available for the artifact.
+  local lookup_restore_errexit=0
+  [[ $- == *e* ]] && lookup_restore_errexit=1
+  set +e
+  it_lookup_public_ipv4 >/dev/null
+  ((lookup_restore_errexit)) && set -e
+  FIRST_VPN_IPV4="${IT_LAST_PUBLIC_IP:-}"
+
   append_artifact "first-vpn.log" "vpn_ipv4=${FIRST_VPN_IPV4:-unavailable}"$'\n'
+  append_artifact "first-vpn.log" "public_ip_probe_status=${IT_LAST_PUBLIC_IP_STATUS:-unknown}"$'\n'
+  append_artifact "first-vpn.log" "public_ip_probe_attempts=${IT_LAST_PUBLIC_IP_ATTEMPTS:-0}"$'\n'
+  append_artifact "first-vpn.log" "public_ip_probe_failure_class=${IT_LAST_PUBLIC_IP_FAILURE_CLASS:-}"$'\n'
+  append_artifact "first-vpn.log" "generic_https_probe=${https_ok}"$'\n'
+  append_artifact "first-vpn.log" "dns_probe=${dns_ok}"$'\n'
+  if [[ -n "${IT_LAST_PUBLIC_IP_DIAG:-}" ]]; then
+    append_artifact "first-vpn.log" "public_ip_probe_diag<<"$'\n'"${IT_LAST_PUBLIC_IP_DIAG}"
+  fi
 
   if ((online_ok == 0)); then
     phase_mark FAIL "${phase}" "airvpn-check --online failed"
@@ -841,14 +885,21 @@ phase_first_vpn() {
   fi
 
   local rc=0
+  local fail_msg=""
   it_public_ip_differs_from_baseline "${FIRST_VPN_IPV4}" "${BASELINE_IPV4}" || rc=$?
   if [[ -n "${FIRST_VPN_IPV4}" && -n "${BASELINE_IPV4}" && "${rc}" -eq 1 ]]; then
-    phase_mark FAIL "${phase}" "VPN public IP matches baseline direct IP"
+    fail_msg="$(it_first_vpn_public_ip_failure_message \
+      "${FIRST_VPN_IPV4}" "${BASELINE_IPV4}" "${dns_ok}" "${https_ok}" \
+      "${IT_LAST_PUBLIC_IP_FAILURE_CLASS:-}")"
+    phase_mark FAIL "${phase}" "${fail_msg}"
     on_failure_guidance
     return 1
   fi
   if [[ -z "${FIRST_VPN_IPV4}" ]]; then
-    phase_mark FAIL "${phase}" "no public IPv4 via VPN"
+    fail_msg="$(it_first_vpn_public_ip_failure_message \
+      "" "${BASELINE_IPV4}" "${dns_ok}" "${https_ok}" \
+      "${IT_LAST_PUBLIC_IP_FAILURE_CLASS:-lookup_inconclusive}")"
+    phase_mark FAIL "${phase}" "${fail_msg}"
     on_failure_guidance
     return 1
   fi

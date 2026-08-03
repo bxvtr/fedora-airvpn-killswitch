@@ -146,7 +146,7 @@ fi
 
 # Online-check failure still attempts public IP capture after diagnostics
 if grep -A40 'capture_vpn_routing_diagnostics "first-vpn"' "${runner}" |
-  grep -q 'lookup_public_ip 4'; then
+  grep -q 'it_lookup_public_ipv4'; then
   pass "first-vpn captures public IP even when preparing online-check outcome"
 else
   fail "first-vpn missing post-activation public IP capture path"

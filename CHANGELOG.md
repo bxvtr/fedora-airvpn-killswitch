@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Harden the VM integration First-VPN public IPv4 probe: bounded provider
+  retries, strict IPv4 validation, preserved curl exit status, layered
+  DNS/HTTPS classification, and structured artifacts so provider outages are
+  not mislabeled as routing leaks (inconclusive lookups remain fail-closed).
 - Verify online WireGuard egress with effective `ip route get` lookups so
   NetworkManager policy routing (`ip4-auto-default-route` / dedicated tables)
   is accepted; reject physical-underlay fallbacks. Capture policy-rule and
