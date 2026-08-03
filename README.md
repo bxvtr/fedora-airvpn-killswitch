@@ -202,7 +202,7 @@ sudo airvpn-status
 sudo airvpn-check --online   # requires active tunnel
 ```
 
-Checks cover commands/services, zones/policies, endpoint exceptions, autoconnect/zone/DNS settings, active managed VPN count, handshake, routes, and unsafe physical connections.
+Checks cover commands/services, zones/policies, endpoint exceptions, autoconnect/zone/DNS settings, active managed VPN count, handshake, effective VPN routing (`ip route get`, including NetworkManager policy-routing tables), and unsafe physical connections.
 
 ## Suspend / resume
 

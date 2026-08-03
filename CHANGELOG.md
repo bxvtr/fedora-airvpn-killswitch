@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Verify online WireGuard egress with effective `ip route get` lookups so
+  NetworkManager policy routing (`ip4-auto-default-route` / dedicated tables)
+  is accepted; reject physical-underlay fallbacks. Capture policy-rule and
+  all-table routing diagnostics in the VM integration runner.
 - Leave newly imported WireGuard profiles inactive: NetworkManager may
   auto-activate on `connection import`; `autoconnect no` alone does not
   disconnect an already-active tunnel. Disconnect and verify inactivity

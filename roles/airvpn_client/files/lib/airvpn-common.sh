@@ -24,6 +24,9 @@ AIRVPN_COMMON_LOADED=1
 : "${AIRVPN_RESTORE_ZONE:=public}"
 : "${AIRVPN_LOCK_FILE:=/run/airvpn-client.lock}"
 : "${AIRVPN_STATE_DIR:=/var/lib/airvpn-client}"
+# Documentation-range probes for effective route lookups (RFC 5737 / RFC 3849).
+: "${AIRVPN_ROUTE_PROBE_V4:=192.0.2.1}"
+: "${AIRVPN_ROUTE_PROBE_V6:=2001:db8::1}"
 
 airvpn_load_config() {
   local conf="${AIRVPN_CONFIG_DIR}/airvpn-client.conf"
@@ -353,6 +356,76 @@ airvpn_ensure_connection_inactive() {
     fi
   fi
   airvpn_wait_inactive "${uuid}" "${timeout}"
+}
+
+# Extract the output interface from `ip route get` text.
+# Sets AIRVPN_ROUTE_GET_DEV and optionally AIRVPN_ROUTE_GET_TABLE.
+# Returns 0 when a device token is present.
+airvpn_parse_route_get_dev() {
+  local text="$1"
+  local -a tokens=()
+  local i token next
+  AIRVPN_ROUTE_GET_DEV=""
+  AIRVPN_ROUTE_GET_TABLE=""
+  # Collapse newlines then tokenize on IFS whitespace (ip route get is keyword-oriented).
+  read -r -a tokens <<<"$(printf '%s' "${text}" | tr '\n' ' ')"
+  for ((i = 0; i < ${#tokens[@]}; i++)); do
+    token="${tokens[i]}"
+    next="${tokens[i + 1]:-}"
+    if [[ "${token}" == "dev" && -n "${next}" && -z "${AIRVPN_ROUTE_GET_DEV}" ]]; then
+      if [[ ! "${next}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        return 1
+      fi
+      AIRVPN_ROUTE_GET_DEV="${next}"
+    elif [[ "${token}" == "table" && -n "${next}" && -z "${AIRVPN_ROUTE_GET_TABLE}" ]]; then
+      AIRVPN_ROUTE_GET_TABLE="${next}"
+    fi
+  done
+  [[ -n "${AIRVPN_ROUTE_GET_DEV}" ]]
+}
+
+# Run a read-only route lookup. family is 4 or 6.
+# Overridable in tests via AIRVPN_TEST_ROUTE_GET_OUTPUT.
+airvpn_ip_route_get() {
+  local family="$1"
+  local dest="$2"
+  if [[ -n "${AIRVPN_TEST_ROUTE_GET_OUTPUT+x}" ]]; then
+    printf '%s\n' "${AIRVPN_TEST_ROUTE_GET_OUTPUT}"
+    return 0
+  fi
+  case "${family}" in
+    4) ip -4 route get "${dest}" ;;
+    6) ip -6 route get "${dest}" ;;
+    *) return 2 ;;
+  esac
+}
+
+# True when the effective route for dest selects exactly iface.
+# Exit: 0 match, 1 mismatch/unproven, 2 usage/lookup invocation error.
+airvpn_effective_route_uses_iface() {
+  local family="$1"
+  local dest="$2"
+  local iface="$3"
+  local out rc=0
+  AIRVPN_ROUTE_GET_DEV=""
+  AIRVPN_ROUTE_GET_TABLE=""
+  [[ "${family}" == "4" || "${family}" == "6" ]] || return 2
+  [[ -n "${dest}" && -n "${iface}" ]] || return 2
+  # Interface names must not contain whitespace or path separators.
+  if [[ ! "${iface}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    return 2
+  fi
+  out="$(airvpn_ip_route_get "${family}" "${dest}" 2>/dev/null)" || rc=$?
+  if ((rc != 0)); then
+    return 1
+  fi
+  if ! airvpn_parse_route_get_dev "${out}"; then
+    return 1
+  fi
+  if [[ "${AIRVPN_ROUTE_GET_DEV}" == "${iface}" ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # Return latest handshake age in seconds for interface, or empty if unavailable.

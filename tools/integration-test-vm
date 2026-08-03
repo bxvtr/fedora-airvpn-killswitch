@@ -423,6 +423,48 @@ that uninstall can restore direct Internet access.
 EOF
 }
 
+# Read-only policy-routing diagnostics after VPN activation (no secrets).
+capture_vpn_routing_diagnostics() {
+  local prefix="${1:-vpn}"
+  local probe4="${AIRVPN_ROUTE_PROBE_V4:-192.0.2.1}"
+  local probe6="${AIRVPN_ROUTE_PROBE_V6:-2001:db8::1}"
+  local uuid=""
+  local active_line=""
+  reload_runtime_config
+  active_line="$(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show --active 2>/dev/null | grep -F "${AIRVPN_CONNECTION_PREFIX}" | head -n1 || true)"
+  if [[ -n "${active_line}" ]]; then
+    uuid="${active_line%%:*}"
+  fi
+  {
+    echo "=== ip -4 rule show ==="
+    ip -4 rule show 2>&1 || true
+    echo "=== ip -6 rule show ==="
+    ip -6 rule show 2>&1 || true
+    echo "=== ip -4 route show table main ==="
+    ip -4 route show table main 2>&1 || true
+    echo "=== ip -6 route show table main ==="
+    ip -6 route show table main 2>&1 || true
+    echo "=== ip -4 route show table all ==="
+    ip -4 route show table all 2>&1 || true
+    echo "=== ip -6 route show table all ==="
+    ip -6 route show table all 2>&1 || true
+    echo "=== ip -4 route get ${probe4} ==="
+    ip -4 route get "${probe4}" 2>&1 || true
+    echo "=== ip -6 route get ${probe6} ==="
+    ip -6 route get "${probe6}" 2>&1 || true
+    if [[ -n "${uuid}" ]]; then
+      echo "=== nmcli non-secret route fields uuid=${uuid} ==="
+      # Explicit allowlist — never request private-key fields.
+      nmcli -g connection.id,connection.uuid,connection.interface-name,connection.zone,connection.autoconnect,ipv4.method,ipv4.never-default,ipv4.route-table,ipv4.routing-rules,ipv4.dns-priority,ipv4.dns-search,ipv6.method,ipv6.never-default,ipv6.route-table,ipv6.routing-rules,ipv6.dns-priority,ipv6.dns-search,wireguard.peer-routes,wireguard.fwmark,wireguard.ip4-auto-default-route,wireguard.ip6-auto-default-route \
+        connection show "${uuid}" 2>&1 || true
+    else
+      echo "=== nmcli route fields skipped (no active managed UUID detected) ==="
+    fi
+  } >"${ARTIFACT_DIR}/${prefix}-routing.raw" 2>&1 || true
+  it_redact_text "$(cat "${ARTIFACT_DIR}/${prefix}-routing.raw")" >"${ARTIFACT_DIR}/${prefix}-routing.txt"
+  rm -f "${ARTIFACT_DIR}/${prefix}-routing.raw"
+}
+
 preflight() {
   local phase="preflight"
   if [[ "${EUID}" -eq 0 ]]; then
@@ -756,6 +798,7 @@ phase_first_vpn() {
   local phase="first-vpn"
   local names selected first second
   local require_second=0
+  local online_ok=1
   ((SKIP_SWITCH == 0)) && require_second=1
   names="$(managed_profile_names)"
   selected="$(it_select_profiles "${names}" "${FIRST_PROFILE}" "${SECOND_PROFILE}" "${require_second}")" || {
@@ -778,14 +821,24 @@ phase_first_vpn() {
   fi
   append_artifact "first-vpn.log" "$(cat "${ARTIFACT_DIR}/first-vpn-activate.log")"
 
+  capture_vpn_routing_diagnostics "first-vpn"
+
   if ! sudo_capture "online-check.log" airvpn-check --online; then
+    online_ok=0
+    append_artifact "first-vpn.log" "online_check=FAIL"$'\n'
+  else
+    append_artifact "first-vpn.log" "online_check=PASS"$'\n'
+  fi
+
+  # Always attempt egress capture for artifacts, even when online-check failed.
+  FIRST_VPN_IPV4="$(lookup_public_ip 4 || true)"
+  append_artifact "first-vpn.log" "vpn_ipv4=${FIRST_VPN_IPV4:-unavailable}"$'\n'
+
+  if ((online_ok == 0)); then
     phase_mark FAIL "${phase}" "airvpn-check --online failed"
     on_failure_guidance
     return 1
   fi
-
-  FIRST_VPN_IPV4="$(lookup_public_ip 4 || true)"
-  append_artifact "first-vpn.log" "vpn_ipv4=${FIRST_VPN_IPV4:-unavailable}"$'\n'
 
   local rc=0
   it_public_ip_differs_from_baseline "${FIRST_VPN_IPV4}" "${BASELINE_IPV4}" || rc=$?
@@ -820,10 +873,22 @@ phase_diagnostics() {
     sudo_firewall_cmd --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" 2>&1 || true
     echo "=== resolvectl status ==="
     resolvectl status 2>&1 || true
-    echo "=== ip -4 route ==="
-    ip -4 route 2>&1 || true
-    echo "=== ip -6 route ==="
-    ip -6 route 2>&1 || true
+    echo "=== ip -4 rule show ==="
+    ip -4 rule show 2>&1 || true
+    echo "=== ip -6 rule show ==="
+    ip -6 rule show 2>&1 || true
+    echo "=== ip -4 route show table main ==="
+    ip -4 route show table main 2>&1 || true
+    echo "=== ip -6 route show table main ==="
+    ip -6 route show table main 2>&1 || true
+    echo "=== ip -4 route show table all ==="
+    ip -4 route show table all 2>&1 || true
+    echo "=== ip -6 route show table all ==="
+    ip -6 route show table all 2>&1 || true
+    echo "=== ip -4 route get ${AIRVPN_ROUTE_PROBE_V4:-192.0.2.1} ==="
+    ip -4 route get "${AIRVPN_ROUTE_PROBE_V4:-192.0.2.1}" 2>&1 || true
+    echo "=== ip -6 route get ${AIRVPN_ROUTE_PROBE_V6:-2001:db8::1} ==="
+    ip -6 route get "${AIRVPN_ROUTE_PROBE_V6:-2001:db8::1}" 2>&1 || true
   } >"${ARTIFACT_DIR}/redacted-diagnostics.raw" 2>&1 || true
   it_redact_text "$(cat "${ARTIFACT_DIR}/redacted-diagnostics.raw")" >"${ARTIFACT_DIR}/redacted-diagnostics.txt"
   rm -f "${ARTIFACT_DIR}/redacted-diagnostics.raw"

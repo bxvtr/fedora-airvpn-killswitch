@@ -322,17 +322,36 @@ check_online_tunnel() {
     fail "handshake unavailable on ${iface}"
   fi
 
-  # Basic route presence via the tunnel interface
-  if ip -4 route show default | grep -q "${iface}"; then
-    pass "IPv4 default route via ${iface}"
-  else
-    fail "IPv4 default route not via ${iface}"
-  fi
-  if airvpn_is_truthy "${AIRVPN_ENABLE_IPV6}"; then
-    if ip -6 route show default | grep -q "${iface}"; then
-      pass "IPv6 default route via ${iface}"
+  # NetworkManager WireGuard often installs the default route in a dedicated
+  # policy-routing table (ip4-auto-default-route / Improved Rule-based Routing).
+  # Checking only `ip route show default` (main table) is a false negative.
+  # Verify the effective lookup for a documentation-range destination instead.
+  local v4_probe="${AIRVPN_ROUTE_PROBE_V4}"
+  if airvpn_effective_route_uses_iface 4 "${v4_probe}" "${iface}"; then
+    if [[ -n "${AIRVPN_ROUTE_GET_TABLE}" ]]; then
+      pass "effective IPv4 route for ${v4_probe} via ${iface} (table ${AIRVPN_ROUTE_GET_TABLE})"
     else
-      warn "IPv6 default route not via ${iface} (server may be IPv4-only)"
+      pass "effective IPv4 route for ${v4_probe} via ${iface}"
+    fi
+  else
+    if [[ -n "${AIRVPN_ROUTE_GET_DEV}" ]]; then
+      fail "effective IPv4 route for ${v4_probe} selects ${AIRVPN_ROUTE_GET_DEV} instead of managed VPN ${iface}"
+    else
+      fail "unable to prove effective IPv4 route for ${v4_probe} uses managed VPN ${iface}"
+    fi
+  fi
+
+  if airvpn_is_truthy "${AIRVPN_ENABLE_IPV6}"; then
+    local v6_probe="${AIRVPN_ROUTE_PROBE_V6}"
+    if airvpn_effective_route_uses_iface 6 "${v6_probe}" "${iface}"; then
+      if [[ -n "${AIRVPN_ROUTE_GET_TABLE}" ]]; then
+        pass "effective IPv6 route for ${v6_probe} via ${iface} (table ${AIRVPN_ROUTE_GET_TABLE})"
+      else
+        pass "effective IPv6 route for ${v6_probe} via ${iface}"
+      fi
+    else
+      # Underlay remains fail-closed; many AirVPN profiles are IPv4-primary.
+      warn "effective IPv6 route for ${v6_probe} not via ${iface} (server/profile may be IPv4-only; underlay should still block)"
     fi
   fi
   : "${_ctype}" "${_device}" "${_state}"

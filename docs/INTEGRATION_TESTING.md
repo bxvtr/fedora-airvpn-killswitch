@@ -86,6 +86,20 @@ inactivity before continuing. Explicit activation remains `airvpn-switch`.
 Offline verification fails if more than one managed VPN is active; a clean
 install should report zero active managed VPNs.
 
+## Online routing verification
+
+NetworkManager WireGuard full-tunnel profiles typically enable
+`wireguard.ip4-auto-default-route` (Improved Rule-based Routing): the default
+route lives in a dedicated table with policy rules, while the main table may
+still show the physical underlay default. Therefore `airvpn-check --online`
+validates **effective** routing with `ip route get` to a documentation-range
+destination (`192.0.2.1` / `2001:db8::1`) and requires the selected device to be
+the active managed WireGuard interface. A handshake alone is not sufficient.
+
+The VM integration runner records `ip rule`, `ip route show table all`, and
+`ip route get` under `first-vpn-routing.txt` after activation. External public-IP
+comparison against the baseline remains an integration-test responsibility.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and
