@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Interactively switch between managed AirVPN NetworkManager profiles.
+# Interactively or non-interactively switch between managed AirVPN profiles.
 set -Eeuo pipefail
 
 SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
@@ -9,19 +9,58 @@ source "${SCRIPT_DIR}/lib/airvpn-common.sh"
 
 usage() {
   cat <<'EOF'
-Usage: airvpn-switch
+Usage: airvpn-switch [--uuid UUID | --name NAME | --disconnect]
 
-Interactively select a managed AirVPN profile. The kill switch remains active
-for the entire operation. On failure, the system fails closed (no direct
-Internet via the underlay).
+Select a managed AirVPN profile. The kill switch remains active for the entire
+operation. On failure, the system fails closed (no direct Internet via the
+underlay).
 
-Options include disconnecting all managed tunnels or cancelling.
+  (no flags)       Interactive menu
+  --uuid UUID      Activate the managed profile with this UUID (non-interactive)
+  --name NAME      Activate the managed profile with this exact name
+  --disconnect     Disconnect all managed AirVPN tunnels
+  -h, --help       Show this help
+
+--uuid, --name, and --disconnect are mutually exclusive.
 EOF
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
+TARGET_UUID=""
+TARGET_NAME=""
+DISCONNECT_ONLY=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --uuid)
+      TARGET_UUID="${2:-}"
+      [[ -n "${TARGET_UUID}" ]] || airvpn_die "--uuid requires a value"
+      shift 2
+      ;;
+    --name)
+      TARGET_NAME="${2:-}"
+      [[ -n "${TARGET_NAME}" ]] || airvpn_die "--name requires a value"
+      shift 2
+      ;;
+    --disconnect)
+      DISCONNECT_ONLY=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      airvpn_die "Unknown argument: $1"
+      ;;
+  esac
+done
+
+mode_count=0
+[[ -n "${TARGET_UUID}" ]] && mode_count=$((mode_count + 1))
+[[ -n "${TARGET_NAME}" ]] && mode_count=$((mode_count + 1))
+((DISCONNECT_ONLY)) && mode_count=$((mode_count + 1))
+if ((mode_count > 1)); then
+  airvpn_die "--uuid, --name, and --disconnect are mutually exclusive"
 fi
 
 airvpn_load_config
@@ -42,10 +81,93 @@ iface_for_uuid() {
   nmcli -g connection.interface-name connection show "${uuid}" 2>/dev/null || true
 }
 
+activate_managed_uuid() {
+  local target_uuid="$1"
+  local target_name="$2"
+
+  airvpn_log "INFO" "Fail-closed switch to: ${target_name}"
+  disconnect_all_managed
+
+  if ! nmcli connection up uuid "${target_uuid}"; then
+    airvpn_die "Activation failed for ${target_name}; direct Internet remains blocked by kill switch"
+  fi
+
+  airvpn_wait_active "${target_uuid}" 60 || airvpn_die "Timed out waiting for ${target_name} to activate"
+
+  local iface
+  iface="$(iface_for_uuid "${target_uuid}")"
+  [[ -n "${iface}" ]] || airvpn_die "No interface name for ${target_name}"
+
+  if ! airvpn_wait_handshake "${iface}" 180 60; then
+    airvpn_log "ERROR" "No recent WireGuard handshake on ${iface}; bringing tunnel down"
+    nmcli connection down uuid "${target_uuid}" >/dev/null 2>&1 || true
+    airvpn_die "Handshake verification failed; kill switch remains active"
+  fi
+
+  local active_count
+  active_count="$(airvpn_count_active_managed)"
+  if [[ "${active_count}" != "1" ]]; then
+    airvpn_die "Expected exactly one active managed VPN, found ${active_count}"
+  fi
+
+  airvpn_log "INFO" "Active: ${target_name} (iface=${iface})"
+}
+
+resolve_managed_by_uuid() {
+  local want="$1"
+  local uuid name _ctype _device _state
+  while IFS='|' read -r uuid name _ctype _device _state; do
+    if [[ "${uuid}" == "${want}" ]]; then
+      printf '%s|%s\n' "${uuid}" "${name}"
+      return 0
+    fi
+  done < <(airvpn_list_managed_connections)
+  return 1
+}
+
+resolve_managed_by_name() {
+  local want="$1"
+  local uuid name _ctype _device _state
+  local -a matches=()
+  while IFS='|' read -r uuid name _ctype _device _state; do
+    if [[ "${name}" == "${want}" ]]; then
+      matches+=("${uuid}|${name}")
+    fi
+  done < <(airvpn_list_managed_connections)
+  if ((${#matches[@]} == 0)); then
+    return 1
+  fi
+  if ((${#matches[@]} > 1)); then
+    airvpn_die "Ambiguous managed profile name '${want}' matches ${#matches[@]} profiles; use --uuid"
+  fi
+  printf '%s\n' "${matches[0]}"
+}
+
 switch_main() {
   mapfile -t rows < <(airvpn_list_managed_connections)
   if ((${#rows[@]} == 0)); then
     airvpn_die "No managed AirVPN profiles found. Run airvpn-import first."
+  fi
+
+  if ((DISCONNECT_ONLY)); then
+    disconnect_all_managed
+    airvpn_log "INFO" "All managed tunnels disconnected; kill switch still active"
+    return 0
+  fi
+
+  if [[ -n "${TARGET_UUID}" || -n "${TARGET_NAME}" ]]; then
+    local resolved=""
+    if [[ -n "${TARGET_UUID}" ]]; then
+      resolved="$(resolve_managed_by_uuid "${TARGET_UUID}")" ||
+        airvpn_die "Managed profile UUID not found: ${TARGET_UUID}"
+    else
+      resolved="$(resolve_managed_by_name "${TARGET_NAME}")" ||
+        airvpn_die "Managed profile name not found: ${TARGET_NAME}"
+    fi
+    local target_uuid target_name
+    IFS='|' read -r target_uuid target_name <<<"${resolved}"
+    activate_managed_uuid "${target_uuid}" "${target_name}"
+    return 0
   fi
 
   echo "Managed AirVPN profiles:"
@@ -86,35 +208,7 @@ switch_main() {
   fi
 
   local idx=$((choice - 1))
-  local target_uuid="${uuids[${idx}]}"
-  local target_name="${names[${idx}]}"
-
-  airvpn_log "INFO" "Fail-closed switch to: ${target_name}"
-  disconnect_all_managed
-
-  if ! nmcli connection up uuid "${target_uuid}"; then
-    airvpn_die "Activation failed for ${target_name}; direct Internet remains blocked by kill switch"
-  fi
-
-  airvpn_wait_active "${target_uuid}" 60 || airvpn_die "Timed out waiting for ${target_name} to activate"
-
-  local iface
-  iface="$(iface_for_uuid "${target_uuid}")"
-  [[ -n "${iface}" ]] || airvpn_die "No interface name for ${target_name}"
-
-  if ! airvpn_wait_handshake "${iface}" 180 60; then
-    airvpn_log "ERROR" "No recent WireGuard handshake on ${iface}; bringing tunnel down"
-    nmcli connection down uuid "${target_uuid}" >/dev/null 2>&1 || true
-    airvpn_die "Handshake verification failed; kill switch remains active"
-  fi
-
-  local active_count
-  active_count="$(airvpn_count_active_managed)"
-  if [[ "${active_count}" != "1" ]]; then
-    airvpn_die "Expected exactly one active managed VPN, found ${active_count}"
-  fi
-
-  airvpn_log "INFO" "Active: ${target_name} (iface=${iface})"
+  activate_managed_uuid "${uuids[${idx}]}" "${names[${idx}]}"
 }
 
 airvpn_with_lock switch switch_main

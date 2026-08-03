@@ -52,6 +52,13 @@ Before proposing a commit, inspect the complete diff and secret-scan results.
 Live Fedora NetworkManager/firewalld/WireGuard tests require explicit human
 authorization and should preferably run in a disposable VM with a snapshot.
 
+Never execute `tools/integration-test-vm` (or `./tools/integration-test-vm`)
+during ordinary agent work. It intentionally modifies live networking. Only run
+it when a human explicitly authorizes the live VM workflow and the command is
+launched manually inside that disposable guest. It must not be allowlisted for
+automatic execution. Do not invoke it from `tools/validate-safe`, pre-commit,
+bootstrap, or GitHub-hosted CI.
+
 ## Language
 
 Repository content remains English. Communicate with the user in German.

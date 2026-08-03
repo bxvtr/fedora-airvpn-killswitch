@@ -128,6 +128,15 @@ if missing:
     print("terminalAllowlist missing: " + ", ".join(missing))
     sys.exit(1)
 
+for banned in (
+    "tools/integration-test-vm",
+    "./tools/integration-test-vm",
+    "integration-test-vm",
+):
+    if banned in allow:
+        print(f"terminalAllowlist must not include live runner: {banned}")
+        sys.exit(1)
+
 for entry in allow:
     if entry in {"git", "bash", "sh", "python", "python3", "ansible-playbook", "pre-commit", "make"}:
         print(f"overly broad terminalAllowlist entry: {entry}")
@@ -135,6 +144,9 @@ for entry in allow:
     # Prefix matching would auto-allow mutating forms (e.g. git branch -D).
     if entry == "git branch" or entry.startswith("git branch "):
         print(f"unsafe terminalAllowlist prefix: {entry}")
+        sys.exit(1)
+    if "integration-test-vm" in str(entry):
+        print(f"terminalAllowlist must not allow integration-test-vm: {entry}")
         sys.exit(1)
 
 if cli.get("version") != 1:
@@ -162,6 +174,8 @@ required_deny = [
     "Shell(bash)",
     "Shell(env)",
     "Shell(command)",
+    "Shell(tools/integration-test-vm)",
+    "Shell(./tools/integration-test-vm)",
     "Read(/etc/wireguard/**)",
     "Write(/etc/**)",
     "Write(tools/validate-safe)",
@@ -189,6 +203,9 @@ for entry in allow_cli:
     if entry.startswith("Shell(git:branch"):
         print(f"cli.json must not allowlist git branch prefixes: {entry}")
         sys.exit(1)
+    if "integration-test-vm" in str(entry):
+        print(f"cli.json must not allow integration-test-vm: {entry}")
+        sys.exit(1)
 
 sys.exit(0)
 PY
@@ -200,13 +217,19 @@ PY
 fi
 
 block_file=".cursor/permissions.json"
-for needle in sudo firewall-cmd nmcli WireGuard ansible-playbook push force secret bypass; do
+for needle in sudo firewall-cmd nmcli WireGuard ansible-playbook push force secret bypass integration-test-vm; do
   if grep -q -i "${needle}" "${block_file}"; then
     pass "block_instructions mention ${needle}"
   else
     fail "block_instructions missing mention of ${needle}"
   fi
 done
+
+if grep -q 'integration-test-vm' .cursor/rules/safe-local-development.mdc; then
+  pass "MDC mentions integration-test-vm"
+else
+  fail "MDC missing integration-test-vm guidance"
+fi
 
 # Only scan validate-safe for host-mutating invocations (avoid self-matching this script).
 if grep -E -q '(^|[[:space:];|&`])(sudo|su|doas|firewall-cmd|nmcli|rpm-ostree|systemctl|reboot|shutdown|poweroff|airvpn-import|airvpn-switch|airvpn-killswitch)([[:space:];|&]|$)' \
@@ -230,6 +253,12 @@ if grep -E '(^|[[:space:]])ansible-playbook([[:space:]]|$)' tools/validate-safe 
   fail "validate-safe ansible-playbook without --syntax-check"
 else
   pass "validate-safe ansible-playbook always uses --syntax-check"
+fi
+
+if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' tools/validate-safe; then
+  fail "validate-safe must not execute tools/integration-test-vm"
+else
+  pass "validate-safe does not execute tools/integration-test-vm"
 fi
 
 conf_bad=0

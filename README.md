@@ -110,15 +110,28 @@ tools/check-agent-safety
 tools/validate-safe
 ```
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the recommended Cursor UI setup and
-limitations. The repository cannot change your global Cursor settings for you.
+Optional live Fedora VM integration test (modifies networking; never automatic):
+
+```bash
+tools/integration-test-vm \
+  --config-source /secure/airvpn-configs \
+  --i-understand-this-modifies-networking
+```
+
+See [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md) and
+[CONTRIBUTING.md](CONTRIBUTING.md). The repository cannot change your global
+Cursor settings for you. Cursor agents must not run `tools/integration-test-vm`
+without explicit human authorization inside a disposable VM.
 
 ## Quick start
 
 1. Export WireGuard configs from AirVPN (prefer **numeric IP** endpoints).
 2. Store them **outside** this repository, e.g. `/secure/airvpn-configs`.
 3. Clone this repository on the Fedora host.
-4. Run:
+4. (Recommended) On a disposable Fedora VM with a snapshot, run
+   `tools/integration-test-vm` as documented in
+   [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
+5. On the target host, install:
 
 ```bash
 ./bootstrap.sh --config-source /secure/airvpn-configs
@@ -126,6 +139,8 @@ sudo airvpn-check --offline
 sudo airvpn-switch
 sudo airvpn-check --online
 ```
+
+`bootstrap.sh` does **not** invoke the live integration test automatically.
 
 Optional local overrides: copy `example.config.yml` to `config.yml` (gitignored).
 
@@ -234,7 +249,11 @@ Authoritative references:
 
 ## CI limitations
 
-GitHub Actions run YAML/Ansible/Shell lint, syntax checks, unit tests, and secret scanning. They do **not** validate live NetworkManager, WireGuard, or firewalld behavior. See `tests/integration/MANUAL_FEDORA_TEST.md`.
+GitHub Actions run YAML/Ansible/Shell lint, syntax checks, unit tests (including
+mocked integration-orchestrator tests), and secret scanning. They do **not**
+run `tools/integration-test-vm`, install playbooks against a live host, or
+validate NetworkManager/WireGuard/firewalld traffic. See
+[docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 
 ## Known limitations
 

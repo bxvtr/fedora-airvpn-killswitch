@@ -68,4 +68,5 @@ vault_pass*
 
 # Test temporary output
 /tests/tmp/
+/tests/integration/artifacts/
 /tmp/

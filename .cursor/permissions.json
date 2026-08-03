@@ -40,6 +40,7 @@
       "Always require explicit user approval for firewalld or WireGuard commands (firewall-cmd, wg, wg-quick) and for disabling firewalld or the project kill switch.",
       "Always require explicit user approval for writes outside the workspace, including /etc, /usr, /var, /run, /boot, and /root.",
       "Always require explicit user approval for live Ansible playbook execution (any ansible-playbook without --syntax-check, bootstrap.sh install paths, or verify/uninstall against the host).",
+      "Always require explicit user approval for tools/integration-test-vm (opt-in live Fedora VM networking test). Never auto-run it from agents, validate-safe, pre-commit, or CI; it modifies NetworkManager/firewalld/WireGuard.",
       "Always require explicit user approval for installed AirVPN runtime commands (airvpn-import, airvpn-switch, airvpn-firewall-sync, airvpn-protect-connection, airvpn-killswitch, airvpn-check, airvpn-status when used to drive host changes).",
       "Always require explicit user approval for indirect execution that appears intended to bypass restrictions (bash -c, sh -c, eval, env, command, xargs, make targets wrapping forbidden tools, Python subprocesses launching forbidden tools, absolute paths to denied tools, or rewriting allowlisted wrappers then immediately running them).",
       "Always require explicit user approval before reading likely secret locations (real AirVPN configs, WireGuard private keys, NetworkManager system-connections, .env files, or paths outside the workspace sought for credentials).",

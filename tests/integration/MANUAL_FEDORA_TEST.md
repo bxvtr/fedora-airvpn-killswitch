@@ -3,10 +3,16 @@
 # WARNING: These steps modify NetworkManager and firewalld on a real host.
 # Do not run them in CI. Do not run them until you explicitly intend to.
 #
+# Prefer the automated opt-in runner when possible:
+#   tools/integration-test-vm \
+#     --config-source /absolute/path/to/airvpn-configs \
+#     --i-understand-this-modifies-networking
+# See docs/INTEGRATION_TESTING.md.
+#
 # Prerequisites:
 # - Fedora Workstation, Spin, or Atomic Desktop with NetworkManager + firewalld
 # - AirVPN WireGuard .conf files with numeric endpoints (outside the Git tree)
-# - Root access
+# - Root access via sudo for privileged steps
 
 ## 1. Install with no active VPN
 ./bootstrap.sh --config-source /absolute/path/to/airvpn-configs

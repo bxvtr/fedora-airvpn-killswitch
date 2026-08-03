@@ -35,8 +35,9 @@ Recommended practices:
   to verify repository guardrail files.
 - Manually inspect every command approval prompt.
 - Keep real AirVPN configurations **outside** the workspace.
-- Run live Fedora integration tests only with explicit human authorization,
-  preferably in a disposable VM with a snapshot.
+- Never auto-run `tools/integration-test-vm` from agents, pre-commit, or CI.
+  Launch it only with explicit human authorization inside a disposable Fedora
+  VM that has a snapshot. See [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
 - Treat Background or Cloud Agents as **code-development** environments only,
   not as places for real host-network tests.
 
@@ -91,7 +92,7 @@ Manual equivalents:
 bash tests/unit/run_all.sh
 yamllint -c .yamllint .
 ansible-lint
-find bootstrap.sh roles/airvpn_client/files tests/unit tools -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' \) -print0 | xargs -0 shellcheck -x -S error
+find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' \) -print0 | xargs -0 shellcheck -x -S error
 for pb in playbooks/*.yml; do
   ansible-playbook --syntax-check "$pb" -e airvpn_config_source=/tmp/dummy -e airvpn_uninstall_confirmed=true
 done

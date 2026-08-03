@@ -49,8 +49,8 @@ printf '      Prefer explicit static tools below.\n\n'
 
 # 1) Bash syntax for known tracked shell entry points (explicit globs; no arbitrary executables)
 mapfile -d '' -t bash_targets < <(
-  find bootstrap.sh roles/airvpn_client/files tests/unit tools \
-    -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' \) \
+  find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools \
+    -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' \) \
     -print0 | sort -z
 )
 
@@ -201,6 +201,18 @@ if ((conf_bad == 0)); then
   pass "no tracked AirVPN .conf outside tests/fixtures"
 else
   fail "tracked AirVPN .conf outside tests/fixtures"
+fi
+
+# 13) Live integration runner must never be invoked from this static wrapper
+if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' "${SCRIPT_PATH}"; then
+  fail "validate-safe must not invoke tools/integration-test-vm"
+else
+  pass "validate-safe does not invoke tools/integration-test-vm"
+fi
+if [[ -x tools/integration-test-vm ]]; then
+  pass "tools/integration-test-vm present (opt-in only; not executed here)"
+else
+  fail "tools/integration-test-vm missing or not executable"
 fi
 
 printf '\n=== summary ===\n'

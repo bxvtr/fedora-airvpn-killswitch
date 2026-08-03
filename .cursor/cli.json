@@ -70,6 +70,8 @@
       "Shell(ansible-playbook)",
       "Shell(bootstrap.sh)",
       "Shell(./bootstrap.sh)",
+      "Shell(tools/integration-test-vm)",
+      "Shell(./tools/integration-test-vm)",
       "Shell(git:push)",
       "Shell(git:push *)",
       "Shell(git:commit)",

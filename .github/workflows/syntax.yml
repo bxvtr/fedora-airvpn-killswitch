@@ -46,4 +46,4 @@ jobs:
           bash -n bootstrap.sh
           while IFS= read -r -d '' f; do
             bash -n "$f"
-          done < <(find roles/airvpn_client/files tests/unit -type f \( -name 'airvpn-*' -o -name '*.sh' \) -print0)
+          done < <(find roles/airvpn_client/files tests/unit tests/integration/lib tools -type f \( -name 'airvpn-*' -o -name '*.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' \) -print0)

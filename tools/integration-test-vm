@@ -1,0 +1,1029 @@
+#!/usr/bin/env bash
+# Opt-in Fedora VM end-to-end integration test for the AirVPN kill switch.
+#
+# WARNING: Modifies NetworkManager, firewalld, WireGuard, and routing inside
+# the guest. Never run automatically from CI, pre-commit, tools/validate-safe,
+# or Cursor agents without explicit human authorization inside a disposable VM.
+#
+# This script refuses to run as root. It uses sudo only for privileged steps.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+LIB_DIR="${ROOT}/tests/integration/lib"
+
+# shellcheck source=../tests/integration/lib/report.sh
+source "${LIB_DIR}/report.sh"
+# shellcheck source=../tests/integration/lib/diagnostics.sh
+source "${LIB_DIR}/diagnostics.sh"
+# shellcheck source=../tests/integration/lib/network-probes.sh
+source "${LIB_DIR}/network-probes.sh"
+# shellcheck source=../tests/integration/lib/assertions.sh
+source "${LIB_DIR}/assertions.sh"
+# shellcheck source=../roles/airvpn_client/files/lib/airvpn-common.sh
+source "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh"
+
+CONSENT=0
+CONFIG_SOURCE=""
+CONFIG_FILE=""
+FIRST_PROFILE=""
+SECOND_PROFILE=""
+OUTPUT_DIR=""
+SKIP_CHECK_MODE=0
+SKIP_SWITCH=0
+SKIP_FORCED_DISCONNECT=0
+SKIP_SUSPEND=1
+RUN_SUSPEND=0
+SKIP_UNINSTALL=0
+SNAPSHOT_CONFIRMED=0
+ALLOW_NON_VM=0
+ALLOW_NON_VM_CONFIRMED=0
+KEEP_ARTIFACTS=1
+NON_INTERACTIVE=0
+ALLOW_DIRTY_TREE=0
+
+ARTIFACT_DIR=""
+BASELINE_IPV4=""
+BASELINE_IPV6=""
+FIRST_VPN_IPV4=""
+SECOND_VPN_IPV4=""
+ANSIBLE_BIN=""
+STATE_UNCERTAIN=0
+KILL_SWITCH_MAY_BE_ACTIVE=0
+
+usage() {
+  cat <<'EOF'
+Usage: tools/integration-test-vm --config-source DIR \
+         --i-understand-this-modifies-networking [options]
+
+Opt-in live Fedora VM integration test. Exercises install, fail-closed
+offline posture, VPN activation, server switch, forced disconnect,
+idempotency, and uninstall using the project's playbooks and runtime
+commands.
+
+Required:
+  --config-source DIR
+      Absolute path outside the Git repository containing AirVPN WireGuard
+      .conf files (numeric endpoints). Keep secrets out of the clone.
+  --i-understand-this-modifies-networking
+      Explicit consent. Without this flag the script exits before any
+      state-changing operation.
+
+Optional:
+  --config-file PATH          Single .conf instead of a directory (implies
+                              --skip-switch-test unless overridden carefully)
+  --first-profile NAME        Managed profile name for first activation
+  --second-profile NAME       Managed profile name for switch test
+  --output-dir PATH           Absolute artifact directory outside the repo
+  --skip-check-mode           Skip ansible-playbook --check --diff
+  --skip-switch-test          Skip server-switch leak probes
+  --skip-forced-disconnect    Skip forced disconnect phase
+  --skip-suspend              Default; suspend/resume is off unless enabled
+  --enable-suspend            Interactive suspend/resume checkpoint
+  --skip-uninstall            Leave the installation in place after tests
+  --snapshot-confirmed        Non-interactive confirmation that a VM snapshot
+                              exists (script cannot verify Boxes snapshots)
+  --allow-non-vm              Dangerous override when not virtualized
+  --allow-non-vm-confirmed    Required with --allow-non-vm in --non-interactive
+  --keep-artifacts            Keep artifact directory (default)
+  --non-interactive           No prompts; requires --snapshot-confirmed
+  --allow-dirty-tree          Allow uncommitted changes (development only)
+  -h, --help                  Show this help
+
+Safety:
+  - Refuses root execution
+  - Refuses bare-metal / non-VM by default
+  - Refuses ordinary containers
+  - Does not flush firewalls or disable the kill switch on failure
+  - Never prints PrivateKey material
+
+This entry point must not be invoked by tools/validate-safe, pre-commit,
+or GitHub-hosted CI.
+EOF
+}
+
+log() { printf '[integration-test-vm] %s\n' "$*"; }
+die() {
+  printf '[integration-test-vm] ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+write_artifact() {
+  local name="$1"
+  local content="$2"
+  local path="${ARTIFACT_DIR}/${name}"
+  it_redact_text "${content}" >"${path}"
+}
+
+append_artifact() {
+  local name="$1"
+  local content="$2"
+  local path="${ARTIFACT_DIR}/${name}"
+  it_redact_text "${content}" >>"${path}"
+}
+
+run_capture() {
+  # run_capture logfile command...
+  local logfile="$1"
+  shift
+  local out rc=0
+  set +e
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  write_artifact "${logfile}" "${out}"$'\n'"[exit=${rc}]"$'\n'
+  return "${rc}"
+}
+
+sudo_capture() {
+  local logfile="$1"
+  shift
+  if sudo -n true >/dev/null 2>&1; then
+    run_capture "${logfile}" sudo -n "$@"
+  else
+    run_capture "${logfile}" sudo "$@"
+  fi
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config-source)
+        CONFIG_SOURCE="${2:-}"
+        [[ -n "${CONFIG_SOURCE}" ]] || die "--config-source requires a path"
+        shift 2
+        ;;
+      --config-file)
+        CONFIG_FILE="${2:-}"
+        [[ -n "${CONFIG_FILE}" ]] || die "--config-file requires a path"
+        shift 2
+        ;;
+      --first-profile)
+        FIRST_PROFILE="${2:-}"
+        shift 2
+        ;;
+      --second-profile)
+        SECOND_PROFILE="${2:-}"
+        shift 2
+        ;;
+      --output-dir)
+        OUTPUT_DIR="${2:-}"
+        shift 2
+        ;;
+      --skip-check-mode) SKIP_CHECK_MODE=1; shift ;;
+      --skip-switch-test) SKIP_SWITCH=1; shift ;;
+      --skip-forced-disconnect) SKIP_FORCED_DISCONNECT=1; shift ;;
+      --skip-suspend) SKIP_SUSPEND=1; RUN_SUSPEND=0; shift ;;
+      --enable-suspend) RUN_SUSPEND=1; SKIP_SUSPEND=0; shift ;;
+      --skip-uninstall) SKIP_UNINSTALL=1; shift ;;
+      --snapshot-confirmed) SNAPSHOT_CONFIRMED=1; shift ;;
+      --allow-non-vm) ALLOW_NON_VM=1; shift ;;
+      --allow-non-vm-confirmed) ALLOW_NON_VM_CONFIRMED=1; shift ;;
+      --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
+      --non-interactive) NON_INTERACTIVE=1; shift ;;
+      --allow-dirty-tree) ALLOW_DIRTY_TREE=1; shift ;;
+      --i-understand-this-modifies-networking) CONSENT=1; shift ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+require_cmd() {
+  local c="$1"
+  command -v "${c}" >/dev/null 2>&1 || die "Required command not found: ${c}. Install it manually; this wrapper does not auto-install packages."
+}
+
+detect_container_like() {
+  if [[ -f /.dockerenv ]] || [[ -f /run/.containerenv ]]; then
+    return 0
+  fi
+  if [[ -r /proc/1/environ ]] && tr '\0' '\n' </proc/1/environ 2>/dev/null | grep -q '^container='; then
+    return 0
+  fi
+  return 1
+}
+
+confirm_snapshot() {
+  if ((SNAPSHOT_CONFIRMED)); then
+    return 0
+  fi
+  if ((NON_INTERACTIVE)); then
+    die "--non-interactive requires --snapshot-confirmed (this script cannot verify GNOME Boxes snapshots)"
+  fi
+  cat <<'EOF'
+========================================================================
+SNAPSHOT REQUIRED
+Create a VM snapshot now (for example in GNOME Boxes) before continuing.
+This script cannot verify Boxes snapshots reliably.
+If anything goes wrong, restore the snapshot rather than flushing firewalls.
+========================================================================
+EOF
+  local ans
+  read -r -p "Type SNAPSHOT_CREATED to continue: " ans
+  [[ "${ans}" == "SNAPSHOT_CREATED" ]] || die "Snapshot confirmation aborted"
+}
+
+confirm_allow_non_vm() {
+  if ((ALLOW_NON_VM == 0)); then
+    return 0
+  fi
+  log "WARNING: --allow-non-vm is strongly discouraged. Prefer a disposable Fedora VM."
+  if ((NON_INTERACTIVE)); then
+    ((ALLOW_NON_VM_CONFIRMED)) || die "--allow-non-vm in --non-interactive mode also requires --allow-non-vm-confirmed"
+    return 0
+  fi
+  local ans
+  read -r -p "Type I_ACCEPT_HOST_NETWORK_RISK to continue on a non-VM host: " ans
+  [[ "${ans}" == "I_ACCEPT_HOST_NETWORK_RISK" ]] || die "Non-VM override aborted"
+}
+
+lookup_public_ip() {
+  local family="$1"
+  local -a urls=()
+  local url body
+  if [[ "${family}" == "4" ]]; then
+    urls=("${IT_DEFAULT_IPV4_URLS[@]}")
+  else
+    urls=("${IT_DEFAULT_IPV6_URLS[@]}")
+  fi
+  for url in "${urls[@]}"; do
+    body="$(curl -"${family}" -fsS --max-time 5 "${url}" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ -n "${body}" ]]; then
+      printf '%s\n' "${body}"
+      return 0
+    fi
+  done
+  return 1
+}
+
+probe_public_http() {
+  # Returns 0 on success (connectivity), 1 on failure/timeout — fail-closed PASS when offline.
+  local family="$1"
+  curl -"${family}" -fsS --max-time 5 -o /dev/null "https://example.com" 2>/dev/null
+}
+
+probe_dns() {
+  local name="${1:-example.com}"
+  getent hosts "${name}" >/dev/null 2>&1
+}
+
+list_config_files() {
+  local dir="$1"
+  find "${dir}" -maxdepth 1 -type f -name '*.conf' | sort
+}
+
+validate_config_endpoints() {
+  local dir="$1"
+  local f endpoint rc
+  local count=0
+  while IFS= read -r f; do
+    [[ -n "${f}" ]] || continue
+    endpoint="$(airvpn_wg_field "${f}" "Endpoint" || true)"
+    [[ -n "${endpoint}" ]] || die "Missing Endpoint in $(basename "${f}")"
+    rc=0
+    airvpn_parse_endpoint "${endpoint}" || rc=$?
+    if ((rc == 2)); then
+      die "Hostname Endpoint not supported in $(basename "${f}"); export numeric IP configs from AirVPN"
+    fi
+    ((rc == 0)) || die "Malformed Endpoint in $(basename "${f}")"
+    count=$((count + 1))
+  done < <(list_config_files "${dir}")
+  printf '%s\n' "${count}"
+}
+
+resolve_ansible() {
+  if [[ -x "${ROOT}/.venv/bin/ansible-playbook" ]]; then
+    ANSIBLE_BIN="${ROOT}/.venv/bin/ansible-playbook"
+  elif command -v ansible-playbook >/dev/null 2>&1; then
+    ANSIBLE_BIN="$(command -v ansible-playbook)"
+  else
+    die "ansible-playbook not found. Prepare the controller with: ./bootstrap.sh --config-source ${CONFIG_SOURCE:-/path} --skip-playbook"
+  fi
+}
+
+managed_profile_names() {
+  sudo nmcli -t -f NAME connection show 2>/dev/null | while IFS= read -r n; do
+    [[ "${n}" == "AirVPN - "* ]] && printf '%s\n' "${n}"
+  done
+}
+
+phase_mark() {
+  local status="$1"
+  local name="$2"
+  local detail="${3:-}"
+  it_phase_record "${status}" "${name}" "${detail}"
+  log "${status}: ${name}${detail:+ — ${detail}}"
+}
+
+on_failure_guidance() {
+  STATE_UNCERTAIN=1
+  KILL_SWITCH_MAY_BE_ACTIVE=1
+  cat <<'EOF' >&2
+------------------------------------------------------------------------
+A required phase failed. The kill switch may still be ACTIVE.
+This runner will NOT disable firewalld, flush nftables/iptables, or run
+firewall-cmd --panic-off / --complete-reload as recovery.
+Prefer restoring your VM snapshot.
+If uninstall was not completed, run it manually only when you understand
+that uninstall can restore direct Internet access.
+------------------------------------------------------------------------
+EOF
+}
+
+preflight() {
+  local phase="preflight"
+  if [[ "${EUID}" -eq 0 ]]; then
+    die "Refusing to run as root. Run as a normal user; sudo is used only for privileged steps."
+  fi
+
+  local msg
+  msg="$(it_validate_option_combo "${CONSENT}" "${CONFIG_SOURCE}" "${CONFIG_FILE}" \
+    "${SKIP_SWITCH}" "${FIRST_PROFILE}" "${SECOND_PROFILE}")" || die "${msg}"
+
+  [[ -d "${ROOT}/.git" && -f "${ROOT}/README.md" ]] || die "Not inside the expected Git repository"
+  cd "${ROOT}"
+
+  if [[ ! -f /etc/os-release ]]; then
+    die "Cannot detect OS"
+  fi
+  # shellcheck disable=SC1091
+  source /etc/os-release
+  [[ "${ID:-}" == "fedora" ]] || die "Unsupported OS '${ID:-unknown}' (Fedora required)"
+
+  local virt="none"
+  if command -v systemd-detect-virt >/dev/null 2>&1; then
+    virt="$(systemd-detect-virt 2>/dev/null || echo none)"
+  fi
+  local container_like=0
+  if detect_container_like; then
+    container_like=1
+  fi
+  # systemd-detect-virt may report container types; treat them as containers.
+  case "${virt}" in
+    docker | podman | lxc | lxc-libvirt | systemd-nspawn | container-other | wsl)
+      container_like=1
+      ;;
+  esac
+  local decision
+  decision="$(it_virt_decision "${virt}" "${ALLOW_NON_VM}" "${container_like}")"
+  case "${decision}" in
+    refuse_container)
+      die "Ordinary container environments are not supported for firewall integration testing (detected virt=${virt})"
+      ;;
+    refuse_non_vm)
+      die "No supported virtualized environment detected (virt=${virt}). Use a disposable Fedora VM, or pass --allow-non-vm (strongly discouraged)."
+      ;;
+  esac
+  confirm_allow_non_vm
+
+  require_cmd curl
+  require_cmd nmcli
+  require_cmd firewall-cmd
+  require_cmd wg
+  require_cmd flock
+  require_cmd getent
+  require_cmd sudo
+  require_cmd git
+  resolve_ansible
+
+  for f in \
+    playbooks/install.yml \
+    playbooks/uninstall.yml \
+    playbooks/verify.yml \
+    tools/validate-safe \
+    roles/airvpn_client/files/airvpn-switch \
+    roles/airvpn_client/files/airvpn-check; do
+    [[ -e "${ROOT}/${f}" ]] || die "Missing required repository file: ${f}"
+  done
+
+  if [[ -n "${CONFIG_FILE}" ]]; then
+    [[ "${CONFIG_FILE}" == /* ]] || die "--config-file must be absolute"
+    it_path_outside_repo "${CONFIG_FILE}" "${ROOT}" || die "Config file must be outside the Git repository"
+    [[ -f "${CONFIG_FILE}" ]] || die "Config file not found: ${CONFIG_FILE}"
+    local tmpdir
+    tmpdir="$(mktemp -d /tmp/airvpn-it-cfg-XXXXXX)"
+    install -m 0600 "${CONFIG_FILE}" "${tmpdir}/$(basename "${CONFIG_FILE}")"
+    CONFIG_SOURCE="${tmpdir}"
+    SKIP_SWITCH=1
+    log "Using single --config-file; switch test disabled"
+  fi
+
+  [[ -n "${CONFIG_SOURCE}" ]] || die "--config-source is required"
+  [[ "${CONFIG_SOURCE}" == /* ]] || die "--config-source must be absolute"
+  it_path_outside_repo "${CONFIG_SOURCE}" "${ROOT}" || die "Config source must be outside the Git repository"
+  [[ -d "${CONFIG_SOURCE}" ]] || die "Config source directory not found: ${CONFIG_SOURCE}"
+
+  local mode
+  mode="$(stat -c '%a' "${CONFIG_SOURCE}" 2>/dev/null || true)"
+  if [[ -n "${mode}" && "${mode}" != "700" && "${mode}" != "750" && "${mode}" != "755" && "${mode}" != "711" ]]; then
+    log "WARN: config source mode is ${mode}; prefer 700"
+  fi
+
+  local conf_count
+  conf_count="$(validate_config_endpoints "${CONFIG_SOURCE}")"
+  ((conf_count >= 1)) || die "Need at least one AirVPN .conf in ${CONFIG_SOURCE}"
+  if ((SKIP_SWITCH == 0 && conf_count < 2)); then
+    die "Switch test requires at least two configs (found ${conf_count}). Add configs or pass --skip-switch-test."
+  fi
+
+  local tracked_bad=0
+  while IFS= read -r path; do
+    [[ -z "${path}" ]] && continue
+    case "${path}" in
+      tests/fixtures/*.conf) ;;
+      *)
+        log "Tracked .conf outside fixtures: ${path}"
+        tracked_bad=1
+        ;;
+    esac
+  done < <(git ls-files '*.conf')
+  ((tracked_bad == 0)) || die "Refusing to run while real/tracked AirVPN confs exist outside tests/fixtures"
+
+  if ((ALLOW_DIRTY_TREE == 0)); then
+    if [[ -n "$(git status --porcelain)" ]]; then
+      die "Unexpected uncommitted changes. Commit/stash them or pass --allow-dirty-tree."
+    fi
+  fi
+
+  local rev
+  rev="$(git rev-parse --short HEAD)"
+  log "Git revision: ${rev} (branch $(git rev-parse --abbrev-ref HEAD))"
+
+  if [[ -n "${OUTPUT_DIR}" ]]; then
+    it_artifact_path_is_safe "${OUTPUT_DIR}" "${ROOT}" || die "Unsafe --output-dir (must be absolute and outside the repository)"
+    ARTIFACT_DIR="${OUTPUT_DIR}"
+  else
+    ARTIFACT_DIR="/tmp/fedora-airvpn-live-test-$(date +%Y%m%d-%H%M%S)"
+  fi
+  mkdir -p "${ARTIFACT_DIR}"
+  chmod 700 "${ARTIFACT_DIR}" || true
+  log "Artifacts: ${ARTIFACT_DIR}"
+
+  write_artifact "metadata.txt" "$(
+    cat <<EOF
+date=$(date -Is)
+hostname=$(hostname 2>/dev/null || true)
+user=$(id -un)
+uid=$(id -u)
+fedora_version=${VERSION_ID:-unknown}
+virt=${virt}
+git_rev=$(git rev-parse HEAD)
+git_branch=$(git rev-parse --abbrev-ref HEAD)
+config_source=${CONFIG_SOURCE}
+conf_count=${conf_count}
+skip_switch=${SKIP_SWITCH}
+skip_uninstall=${SKIP_UNINSTALL}
+run_suspend=${RUN_SUSPEND}
+ansible=${ANSIBLE_BIN}
+note=Reports may contain network metadata (endpoint/public IPs). Private keys are redacted.
+EOF
+  )"
+
+  confirm_snapshot
+  phase_mark PASS "${phase}" "virt=${virt} configs=${conf_count}"
+}
+
+phase_static() {
+  local phase="static-validation"
+  if run_capture "static-validation.log" "${ROOT}/tools/validate-safe"; then
+    phase_mark PASS "${phase}"
+  else
+    phase_mark FAIL "${phase}" "tools/validate-safe failed"
+    on_failure_guidance
+    return 1
+  fi
+}
+
+phase_ansible_syntax() {
+  local phase="ansible-syntax"
+  local ok=1
+  local pb
+  for pb in install.yml verify.yml uninstall.yml; do
+    if ! run_capture "ansible-syntax-${pb}.log" "${ANSIBLE_BIN}" --syntax-check \
+      -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/${pb}" \
+      -e "airvpn_config_source=${CONFIG_SOURCE}" \
+      -e "airvpn_uninstall_confirmed=true"; then
+      ok=0
+    fi
+  done
+  if ((ok)); then
+    phase_mark PASS "${phase}"
+  else
+    phase_mark FAIL "${phase}"
+    return 1
+  fi
+
+  if ((SKIP_CHECK_MODE)); then
+    phase_mark SKIP "ansible-check-mode" "requested"
+    return 0
+  fi
+  log "Running ansible-playbook --check --diff (advisory; does not prove live correctness)."
+  log "Diff output is redacted when written to artifacts; secrets may still exist in memory."
+  set +e
+  local out rc
+  out="$("${ANSIBLE_BIN}" --check --diff \
+    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+    -e "airvpn_config_source=${CONFIG_SOURCE}" 2>&1)"
+  rc=$?
+  set -e
+  write_artifact "ansible-check.log" "${out}"$'\n'"[exit=${rc} advisory]"$'\n'
+  if ((rc == 0)); then
+    phase_mark PASS "ansible-check-mode" "advisory"
+  else
+    phase_mark WARN "ansible-check-mode" "non-zero exit ${rc} (advisory)"
+  fi
+}
+
+phase_baseline() {
+  local phase="baseline"
+  {
+    echo "=== nmcli connection show --active ==="
+    nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show --active || true
+    echo "=== ip -br link ==="
+    ip -br link || true
+    echo "=== firewall-cmd --get-active-zones ==="
+    firewall-cmd --get-active-zones 2>/dev/null || true
+    echo "=== firewall-cmd --get-policies ==="
+    firewall-cmd --get-policies 2>/dev/null || true
+    echo "=== ip -4 route ==="
+    ip -4 route || true
+    echo "=== ip -6 route ==="
+    ip -6 route || true
+    echo "=== resolvectl status ==="
+    resolvectl status 2>/dev/null || true
+  } >"${ARTIFACT_DIR}/baseline-network.raw" 2>&1 || true
+  it_redact_text "$(cat "${ARTIFACT_DIR}/baseline-network.raw")" >"${ARTIFACT_DIR}/baseline-network.txt"
+  rm -f "${ARTIFACT_DIR}/baseline-network.raw"
+
+  BASELINE_IPV4="$(lookup_public_ip 4 || true)"
+  BASELINE_IPV6="$(lookup_public_ip 6 || true)"
+  write_artifact "baseline-public-ip.txt" "ipv4=${BASELINE_IPV4:-unavailable}"$'\n'"ipv6=${BASELINE_IPV6:-unavailable}"$'\n'
+  phase_mark PASS "${phase}" "baseline_ipv4=${BASELINE_IPV4:-none}"
+}
+
+phase_install() {
+  local phase="install"
+  KILL_SWITCH_MAY_BE_ACTIVE=1
+  if ! run_capture "install.log" "${ANSIBLE_BIN}" \
+    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+    -e "airvpn_config_source=${CONFIG_SOURCE}"; then
+    phase_mark FAIL "${phase}" "playbook failed"
+    on_failure_guidance
+    return 1
+  fi
+
+  local fails=0
+  systemctl is-active --quiet firewalld || fails=$((fails + 1))
+  systemctl is-active --quiet NetworkManager || fails=$((fails + 1))
+  firewall-cmd --permanent --info-zone=airvpn >/dev/null 2>&1 || fails=$((fails + 1))
+  firewall-cmd --permanent --info-zone=vpn-underlay >/dev/null 2>&1 || fails=$((fails + 1))
+  firewall-cmd --permanent --info-policy airvpn-host-to-vpn >/dev/null 2>&1 || fails=$((fails + 1))
+  firewall-cmd --permanent --info-policy airvpn-host-to-underlay >/dev/null 2>&1 || fails=$((fails + 1))
+
+  {
+    echo "=== zones ==="
+    firewall-cmd --permanent --info-zone=airvpn || true
+    firewall-cmd --permanent --info-zone=vpn-underlay || true
+    echo "=== policies ==="
+    firewall-cmd --permanent --info-policy airvpn-host-to-vpn || true
+    firewall-cmd --permanent --info-policy airvpn-host-to-underlay || true
+  } >"${ARTIFACT_DIR}/installed-firewall.raw" 2>&1 || true
+  it_redact_text "$(cat "${ARTIFACT_DIR}/installed-firewall.raw")" >"${ARTIFACT_DIR}/installed-firewall.txt"
+  rm -f "${ARTIFACT_DIR}/installed-firewall.raw"
+
+  nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show >"${ARTIFACT_DIR}/installed-networkmanager.txt" 2>&1 || true
+
+  local active_vpn
+  active_vpn="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{print}' | wc -l)"
+  [[ "${active_vpn}" == "0" ]] || fails=$((fails + 1))
+
+  command -v airvpn-check >/dev/null || fails=$((fails + 1))
+  command -v airvpn-switch >/dev/null || fails=$((fails + 1))
+
+  if ((fails == 0)); then
+    phase_mark PASS "${phase}"
+  else
+    phase_mark FAIL "${phase}" "${fails} assertion failure(s)"
+    on_failure_guidance
+    return 1
+  fi
+}
+
+phase_offline() {
+  local phase="offline-fail-closed"
+  local out=""
+  local ok=1
+  if sudo airvpn-check --offline >"${ARTIFACT_DIR}/offline-check.raw" 2>&1; then
+    out="$(cat "${ARTIFACT_DIR}/offline-check.raw")"
+  else
+    out="$(cat "${ARTIFACT_DIR}/offline-check.raw" 2>/dev/null || true)"
+    ok=0
+  fi
+  write_artifact "offline-probes.log" "${out}"
+
+  # Failed public probes are PASS here.
+  local p4=0 p6=0 pdns=0
+  probe_public_http 4 && p4=1
+  probe_public_http 6 && p6=1
+  probe_dns example.com && pdns=1
+  append_artifact "offline-probes.log" $'\n'"probe_http4=${p4} (0=blocked PASS)"$'\n'"probe_http6=${p6}"$'\n'"probe_dns=${pdns}"$'\n'
+
+  if ((p4 == 1)); then
+    ok=0
+    append_artifact "offline-probes.log" "FAIL: public IPv4 reachable without VPN"$'\n'
+  fi
+  if ((p6 == 1)); then
+    ok=0
+    append_artifact "offline-probes.log" "FAIL: public IPv6 reachable without VPN"$'\n'
+  fi
+  if ((pdns == 1)); then
+    # DNS may still resolve from cache; treat success as WARN unless HTTP also works.
+    if ((p4 == 1 || p6 == 1)); then
+      ok=0
+    else
+      phase_mark WARN "${phase}-dns" "getent succeeded while HTTP blocked (possible cache)"
+    fi
+  fi
+
+  if ((ok)); then
+    phase_mark PASS "${phase}" "ordinary public traffic blocked"
+  else
+    phase_mark FAIL "${phase}"
+    on_failure_guidance
+    return 1
+  fi
+}
+
+phase_first_vpn() {
+  local phase="first-vpn"
+  local names selected first second
+  names="$(managed_profile_names)"
+  selected="$(it_select_profiles "${names}" "${FIRST_PROFILE}" "${SECOND_PROFILE}")" || {
+    phase_mark FAIL "${phase}" "could not select managed profiles"
+    return 1
+  }
+  IFS='|' read -r first second <<<"${selected}"
+  FIRST_PROFILE="${first}"
+  SECOND_PROFILE="${second}"
+  write_artifact "first-vpn.log" "selected_first=${first}"$'\n'"selected_second=${second:-none}"$'\n'
+
+  if ! sudo_capture "first-vpn-activate.log" airvpn-switch --name "${first}"; then
+    phase_mark FAIL "${phase}" "airvpn-switch --name failed"
+    on_failure_guidance
+    return 1
+  fi
+  append_artifact "first-vpn.log" "$(cat "${ARTIFACT_DIR}/first-vpn-activate.log")"
+
+  if ! sudo_capture "online-check.log" airvpn-check --online; then
+    phase_mark FAIL "${phase}" "airvpn-check --online failed"
+    on_failure_guidance
+    return 1
+  fi
+
+  FIRST_VPN_IPV4="$(lookup_public_ip 4 || true)"
+  append_artifact "first-vpn.log" "vpn_ipv4=${FIRST_VPN_IPV4:-unavailable}"$'\n'
+
+  local rc=0
+  it_public_ip_differs_from_baseline "${FIRST_VPN_IPV4}" "${BASELINE_IPV4}" || rc=$?
+  if [[ -n "${FIRST_VPN_IPV4}" && -n "${BASELINE_IPV4}" && "${rc}" -eq 1 ]]; then
+    phase_mark FAIL "${phase}" "VPN public IP matches baseline direct IP"
+    on_failure_guidance
+    return 1
+  fi
+  if [[ -z "${FIRST_VPN_IPV4}" ]]; then
+    phase_mark FAIL "${phase}" "no public IPv4 via VPN"
+    on_failure_guidance
+    return 1
+  fi
+  phase_mark PASS "${phase}" "ip=${FIRST_VPN_IPV4}"
+}
+
+phase_diagnostics() {
+  local phase="diagnostics"
+  {
+    echo "=== airvpn-status ==="
+    sudo airvpn-status 2>&1 || true
+    echo "=== wg show (keys omitted by wg for private; still redact) ==="
+    sudo wg show 2>&1 || true
+    echo "=== nmcli connection show --active ==="
+    nmcli connection show --active 2>&1 || true
+    echo "=== firewall-cmd --get-active-zones ==="
+    firewall-cmd --get-active-zones 2>&1 || true
+    echo "=== firewall-cmd --info-policy airvpn-host-to-vpn ==="
+    firewall-cmd --info-policy airvpn-host-to-vpn 2>&1 || true
+    echo "=== firewall-cmd --info-policy airvpn-host-to-underlay ==="
+    firewall-cmd --info-policy airvpn-host-to-underlay 2>&1 || true
+    echo "=== resolvectl status ==="
+    resolvectl status 2>&1 || true
+    echo "=== ip -4 route ==="
+    ip -4 route 2>&1 || true
+    echo "=== ip -6 route ==="
+    ip -6 route 2>&1 || true
+  } >"${ARTIFACT_DIR}/redacted-diagnostics.raw" 2>&1 || true
+  it_redact_text "$(cat "${ARTIFACT_DIR}/redacted-diagnostics.raw")" >"${ARTIFACT_DIR}/redacted-diagnostics.txt"
+  rm -f "${ARTIFACT_DIR}/redacted-diagnostics.raw"
+  phase_mark PASS "${phase}"
+}
+
+phase_switch() {
+  local phase="server-switch"
+  if ((SKIP_SWITCH)); then
+    phase_mark SKIP "${phase}" "requested or single config"
+    return 0
+  fi
+  [[ -n "${SECOND_PROFILE}" ]] || {
+    phase_mark SKIP "${phase}" "no second profile"
+    return 0
+  }
+
+  local pidfile="${ARTIFACT_DIR}/switch-probe.pids"
+  : >"${pidfile}"
+  local probe_log="${ARTIFACT_DIR}/switch-probes.log"
+  : >"${probe_log}"
+
+  (
+    local i observed class
+    for i in $(seq 1 40); do
+      observed="$(lookup_public_ip 4 || echo fail)"
+      class="$(it_classify_switch_observation "${observed}" "${BASELINE_IPV4}" "${FIRST_VPN_IPV4}" "${SECOND_VPN_IPV4}")"
+      printf '%s observed=%s class=%s\n' "$(date -Is)" "${observed}" "${class}" >>"${probe_log}"
+      if [[ "${class}" == "baseline_leak" ]]; then
+        printf 'LEAK\n' >>"${probe_log}"
+      fi
+      sleep 1
+    done
+  ) &
+  echo $! >>"${pidfile}"
+  trap 'it_cleanup_pidfile "'"${pidfile}"'"' EXIT
+
+  if ! sudo_capture "switch-activate.log" airvpn-switch --name "${SECOND_PROFILE}"; then
+    it_cleanup_pidfile "${pidfile}"
+    trap - EXIT
+    phase_mark FAIL "${phase}" "switch to second profile failed"
+    on_failure_guidance
+    return 1
+  fi
+
+  SECOND_VPN_IPV4="$(lookup_public_ip 4 || true)"
+  append_artifact "switch-probes.log" "second_vpn_ipv4=${SECOND_VPN_IPV4:-unavailable}"$'\n'
+
+  # Optional switch back once
+  sudo airvpn-switch --name "${FIRST_PROFILE}" >/dev/null 2>&1 || true
+  sleep 2
+  it_cleanup_pidfile "${pidfile}"
+  trap - EXIT
+
+  if grep -q '^LEAK$' "${probe_log}" 2>/dev/null; then
+    phase_mark FAIL "${phase}" "baseline public IP observed during switch"
+    on_failure_guidance
+    return 1
+  fi
+  local multi
+  multi="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{c++} END{print c+0}')"
+  if [[ "${multi}" -gt 1 ]]; then
+    phase_mark FAIL "${phase}" "multiple managed VPNs active (${multi})"
+    on_failure_guidance
+    return 1
+  fi
+  phase_mark PASS "${phase}"
+}
+
+phase_forced_disconnect() {
+  local phase="forced-disconnect"
+  if ((SKIP_FORCED_DISCONNECT)); then
+    phase_mark SKIP "${phase}" "requested"
+    return 0
+  fi
+
+  # Ensure a VPN is up
+  sudo airvpn-switch --name "${FIRST_PROFILE}" >/dev/null 2>&1 || true
+  if ! sudo_capture "forced-disconnect.log" airvpn-switch --disconnect; then
+    phase_mark FAIL "${phase}" "disconnect failed"
+    on_failure_guidance
+    return 1
+  fi
+
+  local p4=0 p6=0
+  probe_public_http 4 && p4=1
+  probe_public_http 6 && p6=1
+  append_artifact "forced-disconnect.log" "after_disconnect http4=${p4} http6=${p6}"$'\n'
+  if ((p4 == 1 || p6 == 1)); then
+    phase_mark FAIL "${phase}" "public traffic after disconnect"
+    on_failure_guidance
+    return 1
+  fi
+
+  if ! sudo airvpn-switch --name "${FIRST_PROFILE}" >>"${ARTIFACT_DIR}/forced-disconnect.log" 2>&1; then
+    phase_mark FAIL "${phase}" "reactivation failed"
+    on_failure_guidance
+    return 1
+  fi
+  it_redact_text "$(cat "${ARTIFACT_DIR}/forced-disconnect.log")" >"${ARTIFACT_DIR}/forced-disconnect.redacted"
+  mv "${ARTIFACT_DIR}/forced-disconnect.redacted" "${ARTIFACT_DIR}/forced-disconnect.log"
+  phase_mark PASS "${phase}"
+}
+
+phase_suspend() {
+  local phase="suspend-resume"
+  if ((RUN_SUSPEND == 0)); then
+    phase_mark SKIP "${phase}" "disabled by default; pass --enable-suspend"
+    return 0
+  fi
+  if ((NON_INTERACTIVE)); then
+    phase_mark SKIP "${phase}" "requires interactive confirmation"
+    return 0
+  fi
+  cat <<'EOF'
+Pause or suspend the VM now.
+Resume it, wait until the guest is usable, then press Enter.
+EOF
+  read -r -p "Press Enter after resume: " _
+  local active
+  active="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{c++} END{print c+0}')"
+  if [[ "${active}" -gt 1 ]]; then
+    phase_mark FAIL "${phase}" "more than one managed VPN active"
+    return 1
+  fi
+  local observed
+  observed="$(lookup_public_ip 4 || echo fail)"
+  local class
+  class="$(it_classify_switch_observation "${observed}" "${BASELINE_IPV4}" "${FIRST_VPN_IPV4}" "${SECOND_VPN_IPV4}")"
+  write_artifact "resume-check.log" "active_managed=${active}"$'\n'"observed=${observed}"$'\n'"class=${class}"$'\n'
+  if [[ "${class}" == "baseline_leak" ]]; then
+    phase_mark FAIL "${phase}" "baseline IP after resume"
+    on_failure_guidance
+    return 1
+  fi
+  phase_mark PASS "${phase}"
+}
+
+phase_idempotency() {
+  local phase="idempotency"
+  if ! run_capture "idempotency.log" "${ANSIBLE_BIN}" \
+    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+    -e "airvpn_config_source=${CONFIG_SOURCE}"; then
+    phase_mark FAIL "${phase}" "second install failed"
+    on_failure_guidance
+    return 1
+  fi
+  local changed
+  changed="$(grep -E 'changed=[0-9]+' "${ARTIFACT_DIR}/idempotency.log" | tail -n1 || true)"
+  # Document: some tasks may still report changed (e.g. firewall reload). Fail only on play failure.
+  if grep -q 'failed=[1-9]' "${ARTIFACT_DIR}/idempotency.log"; then
+    phase_mark FAIL "${phase}" "failed tasks present"
+    return 1
+  fi
+  local profiles
+  profiles="$(managed_profile_names | wc -l)"
+  append_artifact "idempotency.log" "managed_profile_count=${profiles}"$'\n'"recap_line=${changed}"$'\n'
+  phase_mark PASS "${phase}" "profiles=${profiles} ${changed}"
+}
+
+phase_uninstall() {
+  local phase="uninstall"
+  if ((SKIP_UNINSTALL)); then
+    phase_mark SKIP "${phase}" "requested; kill switch may remain active"
+    KILL_SWITCH_MAY_BE_ACTIVE=1
+    return 0
+  fi
+  if ! run_capture "uninstall.log" "${ANSIBLE_BIN}" \
+    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/uninstall.yml" \
+    -e "airvpn_uninstall_confirmed=true"; then
+    phase_mark FAIL "${phase}" "uninstall playbook failed"
+    on_failure_guidance
+    return 1
+  fi
+
+  local fails=0
+  firewall-cmd --permanent --info-policy airvpn-host-to-vpn >/dev/null 2>&1 && fails=$((fails + 1))
+  firewall-cmd --permanent --info-policy airvpn-host-to-underlay >/dev/null 2>&1 && fails=$((fails + 1))
+  command -v airvpn-check >/dev/null 2>&1 && fails=$((fails + 1))
+  systemctl is-active --quiet NetworkManager || fails=$((fails + 1))
+  systemctl is-active --quiet firewalld || fails=$((fails + 1))
+
+  {
+    echo "=== post uninstall nmcli ==="
+    nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show || true
+    echo "=== post uninstall zones ==="
+    firewall-cmd --get-zones || true
+    echo "=== ip -4 route ==="
+    ip -4 route || true
+  } >"${ARTIFACT_DIR}/post-uninstall-network.raw" 2>&1 || true
+  it_redact_text "$(cat "${ARTIFACT_DIR}/post-uninstall-network.raw")" >"${ARTIFACT_DIR}/post-uninstall-network.txt"
+  rm -f "${ARTIFACT_DIR}/post-uninstall-network.raw"
+
+  # Connectivity should return after uninstall (best-effort).
+  sleep 2
+  if ! probe_public_http 4; then
+    phase_mark WARN "${phase}-connectivity" "IPv4 not restored yet (check DNS/DHCP)"
+  fi
+
+  if ((fails == 0)); then
+    phase_mark PASS "${phase}"
+    KILL_SWITCH_MAY_BE_ACTIVE=0
+    STATE_UNCERTAIN=0
+  else
+    phase_mark FAIL "${phase}" "${fails} assertion failure(s)"
+    on_failure_guidance
+    return 1
+  fi
+}
+
+write_summary() {
+  {
+    echo "=== fedora-airvpn-killswitch live VM integration summary ==="
+    date -Is
+    it_summary_lines
+    echo
+    echo "artifacts=${ARTIFACT_DIR}"
+    echo "kill_switch_may_be_active=${KILL_SWITCH_MAY_BE_ACTIVE}"
+    echo "state_uncertain=${STATE_UNCERTAIN}"
+    if ((STATE_UNCERTAIN)); then
+      echo "ACTION: Prefer restoring the VM snapshot. Do not flush firewalls."
+    fi
+  } | tee "${ARTIFACT_DIR}/summary.txt"
+}
+
+main() {
+  it_report_reset
+  parse_args "$@"
+
+  # Consent gate before any state-changing work (help already exited).
+  if ((CONSENT != 1)); then
+    usage >&2
+    die "Refusing to proceed without --i-understand-this-modifies-networking"
+  fi
+
+  preflight
+
+  phase_static || true
+  if ((IT_FAIL_N > 0)); then
+    write_summary
+    exit 1
+  fi
+
+  phase_ansible_syntax || true
+  if ((IT_FAIL_N > 0)); then
+    write_summary
+    exit 1
+  fi
+
+  phase_baseline
+
+  if ! phase_install; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_offline; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_first_vpn; then
+    write_summary
+    exit 1
+  fi
+
+  phase_diagnostics
+
+  if ! phase_switch; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_forced_disconnect; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_suspend; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_idempotency; then
+    write_summary
+    exit 1
+  fi
+
+  if ! phase_uninstall; then
+    write_summary
+    exit 1
+  fi
+
+  write_summary
+  it_exit_code_from_summary
+}
+
+# Only run main when executed, not when sourced by unit tests.
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  main "$@"
+fi

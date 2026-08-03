@@ -69,13 +69,26 @@ if "git" in allow:
     print("bare git allowlisted")
     sys.exit(1)
 deny = (cli.get("permissions") or {}).get("deny") or []
-for req in ("Shell(sudo)", "Shell(/usr/bin/sudo)", "Write(tools/validate-safe)", "Write(.cursor/rules/**)"):
+for req in (
+    "Shell(sudo)",
+    "Shell(/usr/bin/sudo)",
+    "Shell(tools/integration-test-vm)",
+    "Shell(./tools/integration-test-vm)",
+    "Write(tools/validate-safe)",
+    "Write(.cursor/rules/**)",
+):
     if req not in deny:
         print("missing deny " + req)
         sys.exit(1)
 allow_cli = (cli.get("permissions") or {}).get("allow") or []
 if "Shell(git)" in allow_cli or any(str(x).startswith("Shell(git:branch") for x in allow_cli):
     print("unsafe git allow in cli.json")
+    sys.exit(1)
+if any("integration-test-vm" in str(x) for x in allow):
+    print("integration-test-vm in IDE allowlist")
+    sys.exit(1)
+if any("integration-test-vm" in str(x) for x in allow_cli):
+    print("integration-test-vm in CLI allow")
     sys.exit(1)
 # Invalid JSONC should fail: ensure parser rejects trailing garbage when forced
 try:
