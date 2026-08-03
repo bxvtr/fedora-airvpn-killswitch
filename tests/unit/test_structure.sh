@@ -105,15 +105,84 @@ else
   fail "validate.yml missing policy length asserts"
 fi
 
-# Confirm rejected 23-char name is only intentional in docs/changelog/tests, not as default.
+# Confirm rejected 23-char name is only intentional as legacy cleanup or docs/tests,
+# never as an active default / runtime fallback / newly created policy name.
 bad_default_hits="$(grep -R -n --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.ansible \
   -e 'airvpn-host-to-underlay' "${ROOT}" || true)"
+allowed_legacy_ref='CHANGELOG\.md|docs/|tests/unit/|tests/integration/|roles/airvpn_client/vars/main\.yml|roles/airvpn_client/tasks/firewall\.yml|playbooks/uninstall\.yml'
 if [[ -z "${bad_default_hits}" ]]; then
   pass "rejected underlay policy literal absent from tree"
-elif printf '%s\n' "${bad_default_hits}" | grep -vE 'CHANGELOG\.md|docs/|tests/unit/test_structure\.sh|INTEGRATION_TESTING' >/dev/null; then
+elif printf '%s\n' "${bad_default_hits}" | grep -vE "${allowed_legacy_ref}" >/dev/null; then
   fail "unexpected airvpn-host-to-underlay references:\n${bad_default_hits}"
 else
-  pass "airvpn-host-to-underlay retained only in docs/changelog/tests"
+  pass "airvpn-host-to-underlay retained only as legacy cleanup or docs/tests"
+fi
+
+# Known former VPN default may appear only as legacy cleanup or docs/tests.
+legacy_vpn_hits="$(grep -R -n --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.ansible \
+  -e 'airvpn-host-to-vpn' "${ROOT}" || true)"
+if [[ -z "${legacy_vpn_hits}" ]]; then
+  fail "expected legacy cleanup references to airvpn-host-to-vpn"
+elif printf '%s\n' "${legacy_vpn_hits}" | grep -vE "${allowed_legacy_ref}|README\.md" >/dev/null; then
+  fail "unexpected airvpn-host-to-vpn references:\n${legacy_vpn_hits}"
+else
+  pass "airvpn-host-to-vpn retained only as legacy cleanup or docs/tests"
+fi
+
+# Internal legacy cleanup list must exist and must not be advertised as example config.
+legacy_vars="${ROOT}/roles/airvpn_client/vars/main.yml"
+if [[ -f "${legacy_vars}" ]] &&
+  grep -q 'airvpn_legacy_default_policy_names' "${legacy_vars}" &&
+  grep -q 'airvpn-host-to-vpn' "${legacy_vars}" &&
+  grep -q 'airvpn-host-to-underlay' "${legacy_vars}" &&
+  ! grep -q 'airvpn_legacy_default_policy_names' "${ROOT}/example.config.yml" &&
+  ! grep -q 'airvpn_legacy_default_policy_names' "${ROOT}/roles/airvpn_client/defaults/main.yml"; then
+  pass "internal legacy policy cleanup list present and not public config"
+else
+  fail "legacy policy cleanup list missing or exposed as public config"
+fi
+
+# Install migration: current policies fully configured before legacy delete; check-config
+# after legacy delete; reload includes legacy-changed.
+firewall_yml="${ROOT}/roles/airvpn_client/tasks/firewall.yml"
+set_under_line="$(grep -n 'Set underlay policy target to REJECT' "${firewall_yml}" | head -n1 | cut -d: -f1)"
+legacy_build_line="$(grep -n 'Build legacy firewalld policy cleanup candidates' "${firewall_yml}" | head -n1 | cut -d: -f1)"
+legacy_del_line="$(grep -n 'Remove known legacy project firewalld policies' "${firewall_yml}" | head -n1 | cut -d: -f1)"
+check_line="$(grep -n 'Validate permanent firewalld configuration before reload' "${firewall_yml}" | head -n1 | cut -d: -f1)"
+reload_line="$(grep -n 'Reload firewalld to activate permanent zones and policies' "${firewall_yml}" | head -n1 | cut -d: -f1)"
+if [[ -n "${set_under_line}" && -n "${legacy_build_line}" && -n "${legacy_del_line}" &&
+  -n "${check_line}" && -n "${reload_line}" &&
+  "${set_under_line}" -lt "${legacy_build_line}" &&
+  "${legacy_build_line}" -lt "${legacy_del_line}" &&
+  "${legacy_del_line}" -lt "${check_line}" &&
+  "${check_line}" -lt "${reload_line}" ]] &&
+  grep -q 'reject('\''equalto'\'', airvpn_policy_to_vpn' "${firewall_yml}" &&
+  grep -q 'reject('\''equalto'\'', airvpn_policy_to_underlay' "${firewall_yml}" &&
+  grep -q 'airvpn_legacy_pol_delete is changed' "${firewall_yml}" &&
+  ! grep -qE 'delete-policy.*airvpn-\*|firewall-cmd.*--remove-policy=.*\*' "${firewall_yml}"; then
+  pass "install migrates known legacy policies after current config, before check-config/reload"
+else
+  fail "install legacy policy migration order or guards incorrect"
+fi
+
+# Uninstall removes union of current + legacy, policies before zones, verifies absence.
+if grep -q 'Load airvpn_client internal role vars' "${uninstall}" &&
+  grep -q 'Build uninstall firewalld policy cleanup list' "${uninstall}" &&
+  grep -q 'airvpn_uninstall_policy_names' "${uninstall}" &&
+  grep -q 'Verify project firewalld policies are absent after uninstall' "${uninstall}" &&
+  grep -q 'airvpn_legacy_default_policy_names' "${uninstall}"; then
+  pass "uninstall loads legacy list and verifies policy absence"
+else
+  fail "uninstall missing legacy union cleanup or absence verification"
+fi
+pol_line="$(grep -n 'Remove project firewalld policies if present' "${uninstall}" | head -n1 | cut -d: -f1)"
+zone_rm_line="$(grep -n 'Remove project firewalld zones if present' "${uninstall}" | head -n1 | cut -d: -f1)"
+verify_pol_line="$(grep -n 'Verify project firewalld policies are absent after uninstall' "${uninstall}" | head -n1 | cut -d: -f1)"
+if [[ -n "${pol_line}" && -n "${zone_rm_line}" && -n "${verify_pol_line}" &&
+  "${pol_line}" -lt "${zone_rm_line}" && "${zone_rm_line}" -lt "${verify_pol_line}" ]]; then
+  pass "uninstall removes policies before zones and verifies afterward"
+else
+  fail "uninstall policy/zone/verify order incorrect (pol=${pol_line-} zone=${zone_rm_line-} verify=${verify_pol_line-})"
 fi
 
 # Name validation must precede mutating role imports (scripts/firewall/nm).
@@ -178,13 +247,16 @@ else
   fail "uninstall policy/zone order incorrect (pol=${pol_line-} zone=${zone_rm_line-})"
 fi
 
-# config.yml overrides still load after defaults in uninstall
+# config.yml overrides still load after defaults in uninstall; internal legacy
+# vars load last so the fixed cleanup list is not operator-replaceable.
 def_task="$(grep -n 'Load airvpn_client role defaults' "${uninstall}" | head -n1 | cut -d: -f1)"
 cfg_task="$(grep -n 'Load local config.yml overrides' "${uninstall}" | head -n1 | cut -d: -f1)"
-if [[ -n "${def_task}" && -n "${cfg_task}" && "${def_task}" -lt "${cfg_task}" ]]; then
-  pass "uninstall loads defaults before optional config.yml overrides"
+legacy_task="$(grep -n 'Load airvpn_client internal role vars' "${uninstall}" | head -n1 | cut -d: -f1)"
+if [[ -n "${def_task}" && -n "${cfg_task}" && -n "${legacy_task}" &&
+  "${def_task}" -lt "${cfg_task}" && "${cfg_task}" -lt "${legacy_task}" ]]; then
+  pass "uninstall loads defaults, then config overrides, then internal legacy vars"
 else
-  fail "uninstall variable load order incorrect"
+  fail "uninstall variable load order incorrect (def=${def_task-} cfg=${cfg_task-} legacy=${legacy_task-})"
 fi
 
 atomic="${ROOT}/roles/airvpn_client/tasks/dependencies_fedora_atomic.yml"

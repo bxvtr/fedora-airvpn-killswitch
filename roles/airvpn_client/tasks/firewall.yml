@@ -112,6 +112,42 @@
   register: airvpn_pol_underlay_set_target
   changed_when: airvpn_pol_underlay_set_target.rc == 0
 
+# Migrate away from known former defaults only after current policies are fully
+# configured, so a single subsequent reload activates new protection without a
+# window where neither old nor new policies are defined in permanent config.
+# Current configured names are never deleted even if they match a legacy entry.
+- name: Build legacy firewalld policy cleanup candidates for install migration
+  ansible.builtin.set_fact:
+    airvpn_legacy_policy_cleanup_candidates: >-
+      {{
+        (airvpn_legacy_default_policy_names | default([]))
+        | reject('equalto', '')
+        | reject('equalto', airvpn_policy_to_vpn)
+        | reject('equalto', airvpn_policy_to_underlay)
+        | unique
+        | list
+        | sort
+      }}
+
+- name: Remove known legacy project firewalld policies after current policies are configured
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - --delete-policy
+      - "{{ item }}"
+  loop: "{{ airvpn_legacy_policy_cleanup_candidates }}"
+  register: airvpn_legacy_pol_delete
+  changed_when: airvpn_legacy_pol_delete.rc == 0
+  # Already-absent legacy policies are idempotent success (NOT_ENABLED /
+  # INVALID_POLICY). Unexpected failures remain fatal.
+  failed_when: >-
+    airvpn_legacy_pol_delete.rc != 0
+    and ('NOT_ENABLED' not in (airvpn_legacy_pol_delete.stdout | default(''))
+         and 'NOT_ENABLED' not in (airvpn_legacy_pol_delete.stderr | default(''))
+         and 'INVALID_POLICY' not in (airvpn_legacy_pol_delete.stdout | default(''))
+         and 'INVALID_POLICY' not in (airvpn_legacy_pol_delete.stderr | default('')))
+
 - name: Validate permanent firewalld configuration before reload
   ansible.builtin.command:
     cmd: firewall-cmd --check-config
@@ -132,7 +168,8 @@
     (airvpn_pol_vpn_set_target is changed) or
     (airvpn_pol_underlay_ingress is changed) or
     (airvpn_pol_underlay_egress is changed) or
-    (airvpn_pol_underlay_set_target is changed)
+    (airvpn_pol_underlay_set_target is changed) or
+    (airvpn_legacy_pol_delete is changed)
 
 - name: Synchronize WireGuard endpoint exceptions
   ansible.builtin.command:

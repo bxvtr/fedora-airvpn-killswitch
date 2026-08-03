@@ -188,7 +188,9 @@ HOST -> vpn-underlay  REJECT  (+ exact UDP endpoint exceptions, DHCP/NDP allowan
 Policy object names must be at most **18 characters** on supported Fedora/firewalld.
 Override `airvpn_policy_to_vpn` / `airvpn_policy_to_underlay` only with short
 `[A-Za-z0-9_-]` names; invalid overrides fail before firewalld changes.
-Managed AirVPN interfaces are placed in the `airvpn` zone. Managed physical interfaces are placed in `vpn-underlay`.
+Install removes known former default policy names after the current policies are
+configured; uninstall removes current configured names plus those known former
+defaults. Managed AirVPN interfaces are placed in the `airvpn` zone. Managed physical interfaces are placed in `vpn-underlay`.
 
 `airvpn-killswitch disable` requires typing `DISABLE KILLSWITCH` (or `--force`) and warns that direct traffic may leak. It never stops firewalld globally.
 

@@ -178,3 +178,75 @@ it_classify_firewall_info_absence() {
   fi
   printf 'error\n'
 }
+
+# Classify firewall-cmd --delete-policy results for known project policy names.
+# Args: exit_code combined_stdout_stderr
+# Prints: removed | absent | error
+# Absence markers NOT_ENABLED / INVALID_POLICY are idempotent success.
+# Unexpected non-zero exits are error (fail closed).
+it_classify_firewall_delete_policy() {
+  local rc="${1:-1}"
+  local out="${2:-}"
+
+  if [[ "${rc}" == "0" ]]; then
+    printf 'removed\n'
+    return 0
+  fi
+  if grep -qiE 'NOT_ENABLED|INVALID_POLICY' <<<"${out}"; then
+    printf 'absent\n'
+    return 0
+  fi
+  printf 'error\n'
+}
+
+# Pure helper: build install-migration cleanup candidates from legacy defaults,
+# excluding empty values and currently configured policy names.
+# Args: legacy_csv current_vpn current_underlay
+# Prints sorted unique names, one per line.
+it_legacy_policy_cleanup_candidates() {
+  local legacy_csv="${1-}"
+  local current_vpn="${2-}"
+  local current_underlay="${3-}"
+  local -A seen=()
+  local name
+  local IFS=','
+  # shellcheck disable=SC2086
+  for name in ${legacy_csv}; do
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ -n "${name}" ]] || continue
+    [[ "${name}" == "${current_vpn}" ]] && continue
+    [[ "${name}" == "${current_underlay}" ]] && continue
+    seen["${name}"]=1
+  done
+  if ((${#seen[@]} == 0)); then
+    return 0
+  fi
+  printf '%s\n' "${!seen[@]}" | LC_ALL=C sort -u
+}
+
+# Pure helper: union of current + legacy names for uninstall (sorted, unique).
+# Args: current_vpn current_underlay legacy_csv
+it_uninstall_policy_cleanup_names() {
+  local current_vpn="${1-}"
+  local current_underlay="${2-}"
+  local legacy_csv="${3-}"
+  local -A seen=()
+  local name
+  for name in "${current_vpn}" "${current_underlay}"; do
+    [[ -n "${name}" ]] || continue
+    seen["${name}"]=1
+  done
+  local IFS=','
+  # shellcheck disable=SC2086
+  for name in ${legacy_csv}; do
+    name="${name#"${name%%[![:space:]]*}"}"
+    name="${name%"${name##*[![:space:]]}"}"
+    [[ -n "${name}" ]] || continue
+    seen["${name}"]=1
+  done
+  if ((${#seen[@]} == 0)); then
+    return 0
+  fi
+  printf '%s\n' "${!seen[@]}" | LC_ALL=C sort -u
+}

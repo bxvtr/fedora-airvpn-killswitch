@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Migrate and uninstall known former firewalld policy defaults
+  (`airvpn-host-to-vpn`, defensive `airvpn-host-to-underlay`) so upgrades do
+  not leave duplicate project policies and uninstall cannot leave a legacy
+  underlay REJECT policy behind while reporting success.
 - Harden the VM integration First-VPN public IPv4 probe: bounded provider
   retries, strict IPv4 validation, preserved curl exit status, layered
   DNS/HTTPS classification, and structured artifacts so provider outages are

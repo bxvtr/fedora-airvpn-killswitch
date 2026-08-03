@@ -112,6 +112,53 @@ names="$(it_managed_names_from_terse 'Custom - ' $'u1:Custom - One:wireguard::\n
 [[ "$(it_classify_firewall_info_absence 1 'sudo: a password is required')" == "error" ]] && pass "firewall sudo error not absent" || fail "sudo error"
 [[ "$(it_classify_firewall_info_absence 127 'command not found')" == "error" ]] && pass "firewall unknown error not absent" || fail "unknown error"
 
+# --- legacy firewalld policy cleanup helpers ---
+[[ "$(it_classify_firewall_delete_policy 0 '')" == "removed" ]] && pass "delete-policy success is removed" || fail "delete removed"
+[[ "$(it_classify_firewall_delete_policy 1 'Error: NOT_ENABLED: x')" == "absent" ]] && pass "delete NOT_ENABLED is absent" || fail "delete NOT_ENABLED"
+[[ "$(it_classify_firewall_delete_policy 1 'Error: INVALID_POLICY: x')" == "absent" ]] && pass "delete INVALID_POLICY is absent" || fail "delete INVALID_POLICY"
+[[ "$(it_classify_firewall_delete_policy 1 'Error: AUTHORIZED_FAILED')" == "error" ]] && pass "delete unexpected error is fatal class" || fail "delete fatal"
+[[ "$(it_classify_firewall_delete_policy 1 'sudo: a password is required')" == "error" ]] && pass "delete sudo failure is fatal class" || fail "delete sudo"
+
+legacy_csv='airvpn-host-to-vpn,airvpn-host-to-underlay'
+cands="$(it_legacy_policy_cleanup_candidates "${legacy_csv}" 'airvpn-host-vpn' 'airvpn-host-under')"
+[[ "${cands}" == $'airvpn-host-to-underlay\nairvpn-host-to-vpn' ]] &&
+  pass "install migration candidates include both known legacy names" || fail "cands=${cands}"
+
+cands="$(it_legacy_policy_cleanup_candidates "${legacy_csv}" 'airvpn-host-to-vpn' 'airvpn-host-under')"
+[[ "${cands}" == "airvpn-host-to-underlay" ]] &&
+  pass "current custom/legacy-equal VPN name excluded from install cleanup" || fail "vpn filter=${cands}"
+
+cands="$(it_legacy_policy_cleanup_candidates "${legacy_csv}" 'airvpn-host-vpn' 'airvpn-host-to-underlay')"
+[[ "${cands}" == "airvpn-host-to-vpn" ]] &&
+  pass "current custom/legacy-equal underlay name excluded from install cleanup" || fail "under filter=${cands}"
+
+cands="$(it_legacy_policy_cleanup_candidates "${legacy_csv}" 'airvpn-host-to-vpn' 'airvpn-host-to-underlay')"
+[[ -z "${cands}" ]] &&
+  pass "both current names matching legacy yields empty install cleanup" || fail "both filter=${cands}"
+
+cands="$(it_legacy_policy_cleanup_candidates 'airvpn-host-to-vpn,,airvpn-host-to-vpn' 'airvpn-host-vpn' 'airvpn-host-under')"
+[[ "${cands}" == "airvpn-host-to-vpn" ]] &&
+  pass "install cleanup deduplicates and drops empty legacy entries" || fail "dedup=${cands}"
+
+# Uninstall union includes current defaults + legacy; sorted unique
+union="$(it_uninstall_policy_cleanup_names 'airvpn-host-vpn' 'airvpn-host-under' "${legacy_csv}")"
+[[ "${union}" == $'airvpn-host-to-underlay\nairvpn-host-to-vpn\nairvpn-host-under\nairvpn-host-vpn' ]] &&
+  pass "uninstall union includes current defaults and known legacy names" || fail "union=${union}"
+
+union="$(it_uninstall_policy_cleanup_names 'custom-vpn' 'custom-under' "${legacy_csv}")"
+[[ "${union}" == $'airvpn-host-to-underlay\nairvpn-host-to-vpn\ncustom-under\ncustom-vpn' ]] &&
+  pass "uninstall union keeps custom current names plus legacy" || fail "custom union=${union}"
+
+union="$(it_uninstall_policy_cleanup_names 'airvpn-host-to-vpn' 'airvpn-host-under' "${legacy_csv}")"
+[[ "${union}" == $'airvpn-host-to-underlay\nairvpn-host-to-vpn\nairvpn-host-under' ]] &&
+  pass "uninstall deduplicates overlapping current and legacy names" || fail "overlap union=${union}"
+
+# Absence verification classifier: present must fail closed
+[[ "$(it_classify_firewall_info_absence 0 'policy airvpn-host-to-vpn')" == "present" ]] &&
+  pass "post-uninstall leftover candidate classified present" || fail "leftover present"
+[[ "$(it_classify_firewall_info_absence 1 'INVALID_POLICY')" == "absent" ]] &&
+  pass "post-uninstall missing candidate classified absent" || fail "missing absent"
+
 # Marker-driven probe stop
 marker="$(mktemp)"
 pidfile="$(mktemp)"
