@@ -115,20 +115,10 @@
 # Migrate away from known former defaults only after current policies are fully
 # configured, so a single subsequent reload activates new protection without a
 # window where neither old nor new policies are defined in permanent config.
-# Current configured names are never deleted even if they match a legacy entry.
-- name: Build legacy firewalld policy cleanup candidates for install migration
-  ansible.builtin.set_fact:
-    airvpn_legacy_policy_cleanup_candidates: >-
-      {{
-        (airvpn_legacy_default_policy_names | default([]))
-        | reject('equalto', '')
-        | reject('equalto', airvpn_policy_to_vpn)
-        | reject('equalto', airvpn_policy_to_underlay)
-        | unique
-        | list
-        | sort
-      }}
-
+# Historical names are YAML literals in this task (not Ansible variables), so
+# config.yml / inventory / role params / extra-vars cannot widen the delete set.
+# Current configured names are skipped so an intentional reuse of a former
+# default as the active policy name is not deleted during migration.
 - name: Remove known legacy project firewalld policies after current policies are configured
   ansible.builtin.command:
     argv:
@@ -136,7 +126,12 @@
       - --permanent
       - --delete-policy
       - "{{ item }}"
-  loop: "{{ airvpn_legacy_policy_cleanup_candidates }}"
+  loop:
+    - airvpn-host-to-vpn
+    - airvpn-host-to-underlay
+  when:
+    - item != airvpn_policy_to_vpn
+    - item != airvpn_policy_to_underlay
   register: airvpn_legacy_pol_delete
   changed_when: airvpn_legacy_pol_delete.rc == 0
   # Already-absent legacy policies are idempotent success (NOT_ENABLED /

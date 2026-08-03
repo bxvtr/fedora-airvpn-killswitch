@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Make legacy firewalld policy cleanup use immutable task literals so
+  `config.yml`, inventory, role params, and extra-vars cannot widen
+  `--delete-policy` beyond `airvpn-host-to-vpn` and `airvpn-host-to-underlay`.
 - Align usage, uninstall, and integration-test documentation with current
   CLI options, become prompting, post-install inactive posture, and
   `--skip-uninstall` lifecycle semantics.

@@ -159,6 +159,42 @@ union="$(it_uninstall_policy_cleanup_names 'airvpn-host-to-vpn' 'airvpn-host-und
 [[ "$(it_classify_firewall_info_absence 1 'INVALID_POLICY')" == "absent" ]] &&
   pass "post-uninstall missing candidate classified absent" || fail "missing absent"
 
+# Simulate hostile config.yml / extra-vars defining airvpn_legacy_default_policy_names:
+# executable Ansible tasks must not read that name at all.
+if ! grep -R -n --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.ansible \
+  -e 'airvpn_legacy_default_policy_names' \
+  "${ROOT}/roles/airvpn_client/tasks" "${ROOT}/playbooks" >/dev/null 2>&1; then
+  pass "hostile airvpn_legacy_default_policy_names cannot influence delete-policy tasks"
+else
+  fail "airvpn_legacy_default_policy_names still referenced in tasks/playbooks"
+fi
+
+# Install literal allowlist extraction: exactly the two historical names.
+fw_literals="$(awk '
+  /Remove known legacy project firewalld policies/ {p=1}
+  p && /^[[:space:]]*-[[:space:]]*airvpn-host-to-/ {
+    gsub(/^[[:space:]]*-[[:space:]]*/, "", $0)
+    gsub(/[[:space:]]+$/, "", $0)
+    print
+  }
+  p && /register: airvpn_legacy_pol_delete/ {exit}
+' "${ROOT}/roles/airvpn_client/tasks/firewall.yml" | LC_ALL=C sort -u)"
+[[ "${fw_literals}" == $'airvpn-host-to-underlay\nairvpn-host-to-vpn' ]] &&
+  pass "install delete-policy loop literals are exactly the two historical names" ||
+  fail "install literals unexpected: ${fw_literals}"
+
+# Uninstall Jinja list must quote the same two historical names as literals.
+un_block="$(awk '
+  /Remove project firewalld policies if present/ {p=1}
+  p {print}
+  p && /register: airvpn_del_policy/ {exit}
+' "${ROOT}/playbooks/uninstall.yml")"
+hist_count="$(grep -oE "'airvpn-host-to-(vpn|underlay)'" <<<"${un_block}" | LC_ALL=C sort -u | wc -l)"
+[[ "${hist_count}" -eq 2 ]] &&
+  ! grep -q 'unrelated-admin-policy' <<<"${un_block}" &&
+  pass "uninstall delete-policy list embeds exactly two historical string literals" ||
+  fail "uninstall historical literal count unexpected: ${hist_count}"
+
 # Marker-driven probe stop
 marker="$(mktemp)"
 pidfile="$(mktemp)"

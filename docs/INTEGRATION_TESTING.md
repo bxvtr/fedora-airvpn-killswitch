@@ -67,13 +67,14 @@ each other and from zone names, and must be updated consistently (defaults,
 runtime conf, and uninstall). Invalid overrides fail in early validation before
 any firewalld mutation. Do not rename only one reference by hand.
 
-Install migrates away from known former project defaults
-(`airvpn-host-to-vpn`, and defensively `airvpn-host-to-underlay`) only after the
-current policies are fully configured, then validates and reloads once.
-Uninstall deletes the exact union of the current configured names and those
-known former defaults. The overlong former underlay name exceeds the current
-18-character limit and may never have been creatable on such hosts; cleanup
-still attempts the exact historical name and treats absence as success.
+Install migrates away from known former project defaults by deleting the exact
+historical names `airvpn-host-to-vpn` and (defensively) `airvpn-host-to-underlay`
+only after the current policies are fully configured, then validates and reloads
+once. Those historical names are fixed task literals, not operator-configurable
+variables. Uninstall deletes the exact union of the current configured names and
+those same two historical literals. The overlong former underlay name exceeds the
+current 18-character limit and may never have been creatable on such hosts;
+cleanup still attempts the exact historical name and treats absence as success.
 
 ## WireGuard import filenames
 
