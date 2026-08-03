@@ -161,11 +161,47 @@ else
   fail "networkmanager.yml missing runtime zone reapply"
 fi
 
+# Loop register aggregate .rc must not gate failure; assert over .results instead.
+if grep -A25 'Reapply underlay zone on active physical interfaces' "${nm_yml}" |
+  grep -qE 'failed_when:[[:space:]]*airvpn_runtime_zone\.rc'; then
+  fail "runtime zone task still gates on aggregate register .rc"
+else
+  pass "runtime zone task does not use aggregate register .rc as failed_when"
+fi
+if grep -q 'Fail closed if any underlay runtime zone reapply failed' "${nm_yml}" &&
+  grep -q 'airvpn_runtime_zone.results' "${nm_yml}" &&
+  grep -q 'airvpn_failed_runtime_zone_uuids' "${nm_yml}"; then
+  pass "runtime zone failures asserted over loop results"
+else
+  fail "networkmanager.yml missing results-based runtime zone assert"
+fi
+
+# Simulated Ansible loop results: earlier rc!=0 must remain visible after later success
+# (mirrors the Jinja selectattr('rc','ne',0) | map(attribute='item') filter).
+mock_failed_uuids=""
+while IFS='|' read -r mock_rc mock_item; do
+  [[ -n "${mock_rc}" ]] || continue
+  if [[ "${mock_rc}" != "0" ]]; then
+    mock_failed_uuids+="${mock_item}"$'\n'
+  fi
+done <<'MOCK'
+1|aaaaaaaa-1111-1111-1111-111111111111
+0|bbbbbbbb-2222-2222-2222-222222222222
+MOCK
+mock_failed_uuids="$(printf '%s' "${mock_failed_uuids}" | sed '/^$/d')"
+if [[ "${mock_failed_uuids}" == *'aaaaaaaa-1111-1111-1111-111111111111'* ]] &&
+  [[ "${mock_failed_uuids}" != *'bbbbbbbb-2222-2222-2222-222222222222'* ]]; then
+  pass "earlier failed loop iteration not hidden by later success"
+else
+  fail "loop failure aggregation mock broken: ${mock_failed_uuids}"
+fi
+
 check_script="${ROOT}/roles/airvpn_client/files/airvpn-check"
 if grep -q 'ipv6.dns-priority' "${check_script}" &&
   grep -q 'ipv6.dns-search' "${check_script}" &&
   grep -q 'get-zone-of-interface' "${check_script}" &&
-  grep -q 'airvpn_eval_endpoint_rule_coverage' "${check_script}"; then
+  grep -q 'airvpn_eval_endpoint_rule_coverage' "${check_script}" &&
+  grep -q 'no applicable device for runtime zone check' "${check_script}"; then
   pass "airvpn-check verifies ipv6 DNS, runtime zones, exact endpoint rules"
 else
   fail "airvpn-check missing ipv6/runtime/exact-endpoint assertions"

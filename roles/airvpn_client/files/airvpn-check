@@ -137,10 +137,12 @@ check_endpoint_exceptions() {
 
   if ((count == 0)); then
     warn "no endpoints discovered in managed configs"
-    return
+  else
+    pass "discovered ${count} endpoint exception candidate(s)"
   fi
-  pass "discovered ${count} endpoint exception candidate(s)"
 
+  # Always evaluate coverage: an empty expected set must still fail when
+  # project-shaped endpoint exceptions remain (stale rules).
   local rules
   rules="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --list-rich-rules 2>/dev/null || true)"
 
@@ -151,11 +153,15 @@ check_endpoint_exceptions() {
   set -e
   summary="$(printf '%s\n' "${coverage}" | grep -E '^missing=' | tail -n1 || true)"
   if ((rc == 0)); then
-    pass "endpoint exceptions match managed configs (${summary})"
+    if ((count == 0)); then
+      pass "no project endpoint exceptions present (${summary})"
+    else
+      pass "endpoint exceptions match managed configs (${summary})"
+    fi
   else
     fail "endpoint exceptions do not match managed configs (${summary})"
     while IFS= read -r _line; do
-      [[ "${_line}" == MISSING* || "${_line}" == STALE* ]] || continue
+      [[ "${_line}" == MISSING* || "${_line}" == STALE* || "${_line}" == INVALID_KEY* ]] || continue
       # Rule text contains only numeric destinations/ports — never private keys.
       fail "  ${_line}"
     done <<<"${coverage}"
@@ -222,7 +228,9 @@ check_profiles() {
 }
 
 check_unsafe_physical() {
-  local line uuid name ctype state zone_profile devices device zone_runtime
+  local line uuid name ctype state zone_profile devices_field device zone_runtime
+  local -a applicable=()
+  local list_rc=0
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     airvpn_nmcli_split_terse "${line}"
@@ -240,14 +248,28 @@ check_unsafe_physical() {
       pass "active physical '${name}' profile zone ${zone_profile}"
     fi
 
-    devices="$(nmcli -g GENERAL.DEVICES connection show "${uuid}" 2>/dev/null || true)"
-    devices="${devices//,/ }"
-    if [[ -z "${devices}" || "${devices}" == "--" ]]; then
+    devices_field="$(nmcli -g GENERAL.DEVICES connection show "${uuid}" 2>/dev/null || true)"
+    if [[ -z "${devices_field}" || "${devices_field}" == "--" ]]; then
       fail "active physical '${name}' has no device; cannot verify runtime firewalld zone"
       continue
     fi
-    for device in ${devices}; do
-      [[ -n "${device}" && "${device}" != "--" && "${device}" != "lo" ]] || continue
+
+    applicable=()
+    set +e
+    mapfile -t applicable < <(airvpn_list_applicable_runtime_devices "${devices_field}")
+    list_rc=$?
+    set -e
+    if ((list_rc != 0)); then
+      device="${applicable[0]:-unknown}"
+      fail "active physical '${name}' has unexpected device '${device}' for runtime zone check"
+      continue
+    fi
+    if ((${#applicable[@]} == 0)); then
+      fail "active physical '${name}' has no applicable device for runtime zone check"
+      continue
+    fi
+
+    for device in "${applicable[@]}"; do
       zone_runtime="$(firewall-cmd --get-zone-of-interface="${device}" 2>/dev/null || true)"
       if [[ "${zone_runtime}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
         fail "active physical '${name}' runtime zone on ${device} is '${zone_runtime:-unset}', expected ${AIRVPN_UNDERLAY_ZONE}"

@@ -241,6 +241,92 @@ out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637\nipv4|198.51.10
   "$(printf '%s\n' "${cov4}" "$(airvpn_endpoint_rich_rule ipv4 198.51.100.20 51820)")")" || rc=$?
 [[ "${rc}" -eq 0 && "${out}" == *"covered=2"* ]] && pass "multiple managed endpoints covered" || fail "multi out=${out}"
 
+# Empty expected set: success only when no project-shaped rules remain
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage '' '')" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == *"stale=0"* && "${out}" == *"missing=0"* ]] &&
+  pass "empty expected and empty rules succeed" || fail "empty/empty out=${out} rc=${rc}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage '' "$(printf '%s\n' "${cov4}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"STALE ${cov4}"* && "${out}" == *"stale=1"* ]] &&
+  pass "empty expected with stale project rule fails" || fail "empty/stale out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage '' "$(printf '%s\n' "${admin_udp}")")" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == *"unrelated_udp=1"* && "${out}" != *"STALE"* ]] &&
+  pass "empty expected ignores unrelated admin UDP" || fail "empty/unrelated out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'not-a-key\nipv4|bad' "${cov4}")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"INVALID_KEY"* && "${out}" == *"invalid_keys="* ]] &&
+  pass "malformed endpoint keys rejected" || fail "invalid keys out=${out}"
+
+# airvpn-check must evaluate coverage even when discovery count is zero
+if grep -A40 'check_endpoint_exceptions()' "${ROOT}/roles/airvpn_client/files/airvpn-check" |
+  grep -q 'Always evaluate coverage'; then
+  pass "airvpn-check evaluates coverage when endpoint set is empty"
+else
+  fail "airvpn-check empty-endpoint early return still present"
+fi
+if grep -A25 'failed to collect endpoints' "${ROOT}/roles/airvpn_client/files/airvpn-check" |
+  grep -q 'fail "failed to collect endpoints from managed configs"'; then
+  pass "airvpn-check fails closed on endpoint discovery failure"
+else
+  fail "airvpn-check discovery failure path missing"
+fi
+
+# --- Runtime device classification (no live nmcli/firewalld) ---
+[[ "$(airvpn_classify_runtime_zone_device 'wlp3s0')" == "applicable" ]] &&
+  pass "classify valid wifi device" || fail "classify wlp3s0"
+[[ "$(airvpn_classify_runtime_zone_device 'lo')" == "skip" ]] &&
+  pass "classify lo as skip" || fail "classify lo"
+[[ "$(airvpn_classify_runtime_zone_device '--')" == "skip" ]] &&
+  pass "classify -- as skip" || fail "classify --"
+[[ "$(airvpn_classify_runtime_zone_device '')" == "skip" ]] &&
+  pass "classify empty as skip" || fail "classify empty"
+[[ "$(airvpn_classify_runtime_zone_device 'wg0')" == "unexpected" ]] &&
+  pass "classify wg as unexpected" || fail "classify wg"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices 'wlp3s0')" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == "wlp3s0" ]] && pass "list one valid device" || fail "list one out=${out}"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices 'wlp3s0,--,lo')" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == "wlp3s0" ]] &&
+  pass "list valid plus skipped placeholders" || fail "list mixed out=${out}"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices 'lo')" || rc=$?
+[[ "${rc}" -eq 0 && -z "${out}" ]] && pass "list only lo yields none" || fail "list lo out=${out}"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices '--')" || rc=$?
+[[ "${rc}" -eq 0 && -z "${out}" ]] && pass "list only -- yields none" || fail "list -- out=${out}"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices '')" || rc=$?
+[[ "${rc}" -eq 0 && -z "${out}" ]] && pass "list empty field yields none" || fail "list empty out=${out}"
+
+rc=0
+out="$(airvpn_list_applicable_runtime_devices 'wg0')" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == "wg0" ]] &&
+  pass "list unexpected virtual fails" || fail "list wg out=${out} rc=${rc}"
+
+# Active connection with only skipped devices must fail closed (unit-level contract)
+if grep -q 'reason=no-applicable-device' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh" &&
+  grep -q 'has no applicable device for runtime zone check' "${ROOT}/roles/airvpn_client/files/airvpn-check"; then
+  pass "active connection requires applicable runtime device"
+else
+  fail "no-applicable-device fail-closed path missing"
+fi
+if grep -q "inactive uuid=" "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh"; then
+  pass "inactive connections are distinct from active runtime checks"
+else
+  fail "inactive status line missing"
+fi
+
 if airvpn_firewall_absence_ok 'Error: INVALID_POLICY: x' &&
   airvpn_firewall_absence_ok 'NOT_ENABLED' &&
   ! airvpn_firewall_absence_ok 'sudo: a password is required'; then
