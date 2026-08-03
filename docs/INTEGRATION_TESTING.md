@@ -153,6 +153,26 @@ tools/integration-test-vm \
 Recommended before installing on a primary workstation. **Not mandatory.**
 `bootstrap.sh` does **not** invoke this runner automatically.
 
+By default the runner ends with uninstall and connectivity restoration: a
+**successful lifecycle test** leaves the project **uninstalled**.
+
+Pass `--skip-uninstall` only when you intentionally want the installation to
+**remain present** after the run (for manual follow-up). That is a different
+outcome from a full lifecycle PASS. A failed run—with or without
+`--skip-uninstall`—can leave an installed, active, or uncertain networking
+state; prefer restoring the VM snapshot rather than flushing firewalls.
+
+Other useful flags (see `tools/integration-test-vm --help` for the full list):
+
+| Flag | Effect |
+| --- | --- |
+| `--snapshot-confirmed` | Required with `--non-interactive`; asserts you created a snapshot |
+| `--skip-switch-test` | Skip server-switch leak probes (also needed with a single config) |
+| `--skip-forced-disconnect` | Skip the forced-disconnect phase |
+| `--skip-check-mode` | Skip advisory Ansible check mode |
+| `--enable-suspend` | Interactive suspend/resume (off by default) |
+| `--allow-non-vm` | Dangerous bare-metal override (discouraged) |
+
 ### Direct installation on a supported Fedora host
 
 ```bash
@@ -193,7 +213,13 @@ fixtures under `tests/fixtures/` are documentation-range only.
 | Automation | Not invoked by `validate-safe`, pre-commit, or GitHub-hosted CI |
 
 If a later phase fails after install, assume the kill switch **may still be
-active**. Prefer restoring the VM snapshot when state is uncertain.
+active** and treat host networking state as **uncertain**. Prefer restoring the
+VM snapshot when state is uncertain. Do not flush nftables/iptables or run
+`firewall-cmd --panic-off` / `--complete-reload` as recovery.
+
+When `--skip-uninstall` was used, even a PASS leaves the project installed.
+Uninstall manually only when you understand that removing the kill switch can
+restore direct Internet access.
 
 ## Interpreting results
 

@@ -46,8 +46,8 @@ sudo airvpn-switch
 # While switching and after failures, underlay policy target must stay REJECT.
 
 ## 8. Disconnect the tunnel
-sudo airvpn-switch
-# Choose "Disconnect all managed AirVPN tunnels"
+sudo airvpn-switch --disconnect
+# Or run sudo airvpn-switch and choose "Disconnect all managed AirVPN tunnels"
 
 ## 9. Confirm that traffic is blocked
 # curl to the public Internet should fail again.
@@ -73,6 +73,8 @@ sudo airvpn-status
 ## 14. Run uninstall and verify rollback
 cd /path/to/fedora-airvpn-killswitch
 source .venv/bin/activate
-ansible-playbook playbooks/uninstall.yml -e airvpn_uninstall_confirmed=true
+ansible-playbook playbooks/uninstall.yml \
+  --ask-become-pass \
+  -e airvpn_uninstall_confirmed=true
 # Confirm project zones/policies are gone and physical zones restored.
 # WARNING: direct Internet may work again after uninstall.

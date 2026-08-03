@@ -18,6 +18,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Align usage, uninstall, and integration-test documentation with current
+  CLI options, become prompting, post-install inactive posture, and
+  `--skip-uninstall` lifecycle semantics.
 - Migrate and uninstall known former firewalld policy defaults
   (`airvpn-host-to-vpn`, defensive `airvpn-host-to-underlay`) so upgrades do
   not leave duplicate project policies and uninstall cannot leave a legacy

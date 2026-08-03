@@ -141,6 +141,10 @@ sudo airvpn-switch
 sudo airvpn-check --online
 ```
 
+After a successful install, managed AirVPN profiles are present but **inactive**
+(zero active managed tunnels). The kill switch remains enabled, so ordinary
+Internet traffic stays blocked until you activate a profile with `airvpn-switch`.
+
 `bootstrap.sh` does **not** invoke the live integration test automatically.
 
 Optional local overrides: copy `example.config.yml` to `config.yml` (gitignored).
@@ -167,13 +171,30 @@ Check mode is best-effort; some NetworkManager/firewalld operations are not full
 
 | Command | Purpose |
 | --- | --- |
-| `airvpn-import --source DIR [--mode add\|replace]` | Import/harden profiles and sync endpoint exceptions |
-| `airvpn-switch` | Interactive fail-closed server switch |
-| `airvpn-firewall-sync` | Synchronize firewalld endpoint exceptions |
+| `airvpn-import --source DIR [--mode add\|replace] [--dry-run]` | Import/harden profiles and sync endpoint exceptions |
+| `airvpn-switch [--name NAME \| --uuid UUID \| --disconnect]` | Activate a managed profile (interactive if no flag) or disconnect all managed tunnels |
+| `airvpn-firewall-sync [--dry-run]` | Synchronize firewalld endpoint exceptions |
 | `airvpn-status` | Status report (never prints private keys) |
 | `airvpn-check --offline\|--online` | Verification with non-zero exit on failure |
-| `airvpn-killswitch status\|enable\|disable` | Manage **only** project kill-switch policies |
+| `airvpn-killswitch status\|enable\|disable [--force]` | Manage **only** project kill-switch policies |
 | `airvpn-protect-connection NAME\|UUID` | Protect a new Wi-Fi/Ethernet profile |
+
+Wrappers are installed under `/usr/local/bin`; implementation scripts live under
+`/usr/local/libexec/airvpn-client`. Runtime commands require root via `sudo`.
+
+### Activate, switch, or disconnect
+
+```bash
+sudo airvpn-status
+sudo airvpn-switch                          # interactive menu
+sudo airvpn-switch --name "AirVPN - …"      # exact managed profile name
+sudo airvpn-switch --uuid <uuid>
+sudo airvpn-switch --disconnect             # tear down managed tunnels; kill switch stays on
+```
+
+Disconnect leaves the fail-closed underlay in place: ordinary Internet traffic
+remains blocked until you activate a profile again (or intentionally disable
+the kill switch / uninstall).
 
 ## Expected kill-switch behavior
 
@@ -229,10 +250,18 @@ sudo airvpn-import --source /secure/airvpn-configs --mode replace
 
 ```bash
 source .venv/bin/activate
-ansible-playbook playbooks/uninstall.yml -e airvpn_uninstall_confirmed=true
+ansible-playbook playbooks/uninstall.yml \
+  --ask-become-pass \
+  -e airvpn_uninstall_confirmed=true
 ```
 
-WARNING: Uninstalling removes project kill-switch policies/zones and can restore direct Internet access. Managed config copies are preserved unless `-e airvpn_uninstall_delete_configs=true`.
+`--ask-become-pass` lets Ansible prompt for the sudo/become password on the
+TTY (the playbook uses `become`). Inventory defaults come from `ansible.cfg`.
+
+WARNING: Uninstalling removes project kill-switch policies/zones (including
+known former default policy names) and can restore direct Internet access.
+Managed config copies under `/etc/airvpn-client/configs` are preserved unless
+`-e airvpn_uninstall_delete_configs=true`.
 
 ## Troubleshooting
 
