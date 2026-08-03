@@ -15,6 +15,8 @@
 # - Root access via sudo for privileged steps
 
 ## 1. Install with no active VPN
+# Run as your normal user (not sudo ./bootstrap.sh). Ansible prompts for the
+# become/sudo password via --ask-become-pass for privileged install tasks.
 ./bootstrap.sh --config-source /absolute/path/to/airvpn-configs
 sudo airvpn-check --offline
 

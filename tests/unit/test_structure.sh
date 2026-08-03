@@ -677,6 +677,15 @@ else
   fail "bootstrap collection install path or --skip-playbook missing"
 fi
 
+if grep -q 'bootstrap_install_argv' "${bootstrap}" &&
+  grep -q -- '--ask-become-pass' "${bootstrap}" &&
+  grep -q 'EUID' "${bootstrap}" &&
+  grep -q 'Do not run bootstrap.sh as root or through sudo' "${bootstrap}"; then
+  pass "bootstrap adds --ask-become-pass for playbook runs and refuses root"
+else
+  fail "bootstrap missing --ask-become-pass helper and/or root refusal"
+fi
+
 # Relative cfg path and bootstrap absolute path must resolve to the same directory name.
 if [[ "${cfg_first_path}" == ".ansible/collections" ]] &&
   grep -q 'ROOT_DIR}/.ansible/collections' "${bootstrap}"; then

@@ -58,6 +58,14 @@ Atomic hosts are detected via `/run/ostree-booted` (plus Ansible facts).
 
 Creates a repository-local Python virtualenv, installs **pinned** `ansible-core` and tooling from `requirements-controller.txt`, installs **pinned** collections from `requirements.yml`, then runs `playbooks/install.yml`.
 
+Run `./bootstrap.sh` as your **normal user**, not via `sudo`. Controller
+dependencies and collections are installed under the repository as that user.
+The install playbook uses Ansible `become`; bootstrap passes `--ask-become-pass`
+so Ansible prompts on the TTY for your sudo/become password. The project does
+not store that password. Normal sudo authorization is enough; passwordless sudo
+is not required. Do not run the entire bootstrap as root (that can create
+root-owned `.venv` / `.ansible` artifacts).
+
 Ansible cannot install itself through a playbook that cannot yet run.
 
 ### 2. Ansible runtime and collections
@@ -87,6 +95,14 @@ AirVPN WireGuard `.conf` files contain **private keys**.
 - Never commit them.
 - Never store them inside this Git repository.
 - Keep source directories mode `0700` and files mode `0600` when practical.
+  For configs owned by your normal user (no `sudo` needed for these `chmod`
+  examples):
+
+```bash
+chmod 700 ~/Downloads/Air
+chmod 600 ~/Downloads/Air/*.conf
+```
+
 - This project copies configs only to a root-owned directory (`/etc/airvpn-client/configs` by default).
 
 ## Cursor agent safety (local development)
@@ -132,10 +148,12 @@ without explicit human authorization inside a disposable VM.
 4. (Recommended) On a disposable Fedora VM with a snapshot, run
    `tools/integration-test-vm` as documented in
    [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
-5. On the target host, install:
+5. On the target host, install (as your normal user; Ansible will prompt for
+   the become/sudo password when privileged tasks run):
 
 ```bash
-./bootstrap.sh --config-source /secure/airvpn-configs
+./bootstrap.sh \
+  --config-source /secure/airvpn-configs
 sudo airvpn-check --offline
 sudo airvpn-switch
 sudo airvpn-check --online
@@ -146,6 +164,14 @@ After a successful install, managed AirVPN profiles are present but **inactive**
 Internet traffic stays blocked until you activate a profile with `airvpn-switch`.
 
 `bootstrap.sh` does **not** invoke the live integration test automatically.
+
+Controller-only preparation (no playbook, no become password prompt):
+
+```bash
+./bootstrap.sh \
+  --config-source /secure/airvpn-configs \
+  --skip-playbook
+```
 
 Optional local overrides: copy `example.config.yml` to `config.yml` (gitignored).
 
@@ -162,10 +188,15 @@ If required commands/packages are missing, bootstrap/role stops with layering in
 ### Check mode
 
 ```bash
-./bootstrap.sh --config-source /secure/airvpn-configs --check
+./bootstrap.sh \
+  --config-source /secure/airvpn-configs \
+  --check
 ```
 
-Check mode is best-effort; some NetworkManager/firewalld operations are not fully simulated.
+Check mode is best-effort and should not apply normal live changes; some
+NetworkManager/firewalld operations are not fully simulated. Ansible may still
+prompt for the become password because check mode inspects privileged host
+state.
 
 ## Usage commands
 
@@ -270,6 +301,7 @@ Managed config copies under `/etc/airvpn-client/configs` are preserved unless
 - **Active Wi-Fi not protected**: Run `airvpn-protect-connection`.
 - **Handshake timeout**: Kill switch stays enabled; inspect `airvpn-status` and endpoint exceptions.
 - **Need temporary direct access**: Only via explicit `airvpn-killswitch disable` (dangerous) or uninstall.
+- **`Premature end of stream waiting for become success` / `sudo: a password is required` during bootstrap**: Use a current `bootstrap.sh` that passes `--ask-become-pass`, run it as your normal user (not `sudo ./bootstrap.sh`), and allow Ansible’s interactive become prompt. Do not “fix” this by running the whole bootstrap as root. If an earlier `sudo ./bootstrap` left root-owned `.venv` or `.ansible`, check ownership of those paths before recreating them as your user.
 
 ## Architecture
 

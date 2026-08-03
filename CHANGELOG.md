@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prompt for the Ansible become password from `bootstrap.sh` via
+  `--ask-become-pass` on live and check-mode install runs; refuse root/sudo
+  bootstrap so repository-local `.venv` / `.ansible` stay user-owned; document
+  normal-user install, skip-playbook, and the become-stream troubleshooting case.
 - Make legacy firewalld policy cleanup use immutable task literals so
   `config.yml`, inventory, role params, and extra-vars cannot widen
   `--delete-policy` beyond `airvpn-host-to-vpn` and `airvpn-host-to-underlay`.

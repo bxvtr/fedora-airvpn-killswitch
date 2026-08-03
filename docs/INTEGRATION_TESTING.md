@@ -176,9 +176,16 @@ Other useful flags (see `tools/integration-test-vm --help` for the full list):
 
 ### Direct installation on a supported Fedora host
 
+Run as your normal user (not `sudo ./bootstrap.sh`). Bootstrap installs
+controller tooling repository-locally, then Ansible prompts for the
+become/sudo password via `--ask-become-pass`:
+
 ```bash
 ./bootstrap.sh --config-source /absolute/path/to/airvpn-configs
 ```
+
+`--skip-playbook` prepares only the repository-local controller environment
+and does not run the install playbook or request a become password.
 
 ## Requirements
 
