@@ -4,6 +4,11 @@ This project separates **static validation** from an **opt-in live Fedora VM
 integration test**. The live test modifies networking and must never run by
 accident.
 
+For a first-time overview that also covers Ansible check mode, direct
+installation, and installed-state verification (`airvpn-check`), see
+[Choose how to validate, test, or install](../README.md#choose-how-to-validate-test-or-install)
+in the README.
+
 ## What static tests already prove
 
 `tools/validate-safe` and the unit suite prove, among other things:
@@ -244,12 +249,16 @@ IPs). Treat artifact directories as sensitive.
 
 ## Distinguishing entry points
 
+Short reference (full decision table:
+[README](../README.md#choose-how-to-validate-test-or-install)):
+
 | Command | What it does |
 | --- | --- |
-| `tools/validate-safe` | Static, non-destructive validation |
-| `airvpn-check --offline` | Installed host posture without requiring an active VPN |
-| `airvpn-check --online` | Installed host posture including live tunnel checks |
-| `tools/integration-test-vm` | Full opt-in lifecycle in a disposable VM |
+| `tools/validate-safe` | Static validation (non-destructive; no live networking proof) |
+| `./bootstrap.sh … --check` | Ansible check mode (best-effort; not a live integration test) |
+| `tools/integration-test-vm` | Live VM integration test (real install; not a dry run) |
+| `./bootstrap.sh …` | Direct installation on the target host |
+| `airvpn-check --offline` / `--online` | Installed-state verification |
 
 ## CI limitation
 

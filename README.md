@@ -120,12 +120,17 @@ for live NetworkManager/firewalld tests.
 | `.cursor/rules/*.mdc` | Local Agent project rules (instructions, not a sandbox) |
 | `.cursor/BUGBOT.md` | Bugbot review instructions only |
 
-Preferred static validation:
+Preferred static validation for agents (and anyone editing this tree):
 
 ```bash
 tools/check-agent-safety
 tools/validate-safe
 ```
+
+`tools/validate-safe` is the general **static validation** entry point for the
+repository, not only a Cursor helper. For how it compares to Ansible check
+mode, the live VM test, direct installation, and installed-state verification,
+see [Choose how to validate, test, or install](#choose-how-to-validate-test-or-install).
 
 Optional live Fedora VM integration test (modifies networking; never automatic):
 
@@ -140,16 +145,56 @@ See [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md) and
 Cursor settings for you. Cursor agents must not run `tools/integration-test-vm`
 without explicit human authorization inside a disposable VM.
 
+## Choose how to validate, test, or install
+
+These paths have different goals and proof levels. They are **not**
+interchangeable. Use this table before the Quick start commands below.
+
+| Goal | Command | Changes the host or network? | What it proves | Recommended environment |
+| --- | --- | --- | --- | --- |
+| Static validation | `tools/validate-safe` | No live networking, package, or Git mutations | Repository structure, shell/YAML/Ansible static checks, mocked unit tests, and secret-path guards only (optional tools may `SKIP`) | Development checkout |
+| Ansible check mode | `./bootstrap.sh … --check` | Prepares repo-local controller tooling; playbook runs with `--check --diff` (best-effort host inspection; no normal live install intended). May still prompt for become | Ansible planning plus limited privileged inspection — **not** real firewalld/NetworkManager/WireGuard/DNS/routing or leak-prevention behavior | Test VM or target host with caution |
+| Live VM integration test | `tools/integration-test-vm …` | **Yes** — real install and live NetworkManager/firewalld/WireGuard/routing/DNS exercises | End-to-end lifecycle behavior on a real Fedora guest (still not a universal “no leaks” guarantee) | Disposable Fedora VM with a fresh snapshot |
+| Direct installation | `./bootstrap.sh …` | **Yes** — installs and configures the host | That the install playbook completed; profiles are imported but left **inactive** until `airvpn-switch` | Intended Fedora target (after reviewing safer paths) |
+| Installed-state verification | `sudo airvpn-check --offline` / `--online` | Read-only checks of the current installed state (`--online` needs an active managed tunnel) | Configuration and fail-closed posture (offline); plus live tunnel/routing checks (online). Not a substitute for pre-install validation | Already installed Fedora system |
+
+How to read the table:
+
+- `tools/integration-test-vm` performs a **real** installation and live
+  networking tests inside a disposable Fedora VM. It is **not** a dry run.
+  Failed runs can leave installed or uncertain networking state; prefer
+  restoring the snapshot. Details:
+  [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
+- `tools/validate-safe` and Ansible check mode do **not** prove real
+  firewalld, NetworkManager, WireGuard, DNS, routing, or leak-prevention
+  behavior.
+- `bootstrap.sh` does **not** automatically run the live VM integration test.
+- `airvpn-check` verifies an **already installed** state; it is not
+  pre-installation validation.
+
+### Recommended first-time path
+
+1. Run static validation (`tools/validate-safe`).
+2. Optionally preview the install with Ansible check mode (`./bootstrap.sh … --check`).
+3. Run the live VM integration test in a disposable Fedora VM with a fresh snapshot.
+4. Install on the intended target only after reviewing those results.
+5. Verify the installed state with `airvpn-check` (offline, then online after `airvpn-switch`).
+
 ## Quick start
+
+If you are unsure which path to take, read
+[Choose how to validate, test, or install](#choose-how-to-validate-test-or-install)
+first. Concrete commands for a typical careful install:
 
 1. Export WireGuard configs from AirVPN (prefer **numeric IP** endpoints).
 2. Store them **outside** this repository, e.g. `/secure/airvpn-configs`.
 3. Clone this repository on the Fedora host.
-4. (Recommended) On a disposable Fedora VM with a snapshot, run
-   `tools/integration-test-vm` as documented in
+4. Run static validation: `tools/validate-safe`.
+5. (Recommended) On a disposable Fedora VM with a snapshot, run the live VM
+   integration test as documented in
    [docs/INTEGRATION_TESTING.md](docs/INTEGRATION_TESTING.md).
-5. On the target host, install (as your normal user; Ansible will prompt for
-   the become/sudo password when privileged tasks run):
+6. On the target host, install as your normal user (Ansible prompts for the
+   become/sudo password; do **not** use `sudo ./bootstrap.sh`):
 
 ```bash
 ./bootstrap.sh \
@@ -164,6 +209,8 @@ After a successful install, managed AirVPN profiles are present but **inactive**
 Internet traffic stays blocked until you activate a profile with `airvpn-switch`.
 
 `bootstrap.sh` does **not** invoke the live integration test automatically.
+`airvpn-check` only verifies that installed state; it does not replace the
+static validation or live VM steps above.
 
 Controller-only preparation (no playbook, no become password prompt):
 
@@ -187,6 +234,10 @@ If required commands/packages are missing, bootstrap/role stops with layering in
 
 ### Check mode
 
+Ansible check mode is an intermediate step between static validation and a real
+install or live VM test. See
+[Choose how to validate, test, or install](#choose-how-to-validate-test-or-install).
+
 ```bash
 ./bootstrap.sh \
   --config-source /secure/airvpn-configs \
@@ -196,7 +247,7 @@ If required commands/packages are missing, bootstrap/role stops with layering in
 Check mode is best-effort and should not apply normal live changes; some
 NetworkManager/firewalld operations are not fully simulated. Ansible may still
 prompt for the become password because check mode inspects privileged host
-state.
+state. It does **not** prove real kill-switch or leak-prevention behavior.
 
 ## Usage commands
 
@@ -248,7 +299,10 @@ defaults. Managed AirVPN interfaces are placed in the `airvpn` zone. Managed phy
 
 ## Verification
 
-Prefer host-state inspection over website leak tests:
+Prefer host-state inspection over website leak tests. These commands are
+**installed-state verification** after installation (or after the live VM test
+leaves an install in place). They are not a substitute for
+[static validation or pre-install testing](#choose-how-to-validate-test-or-install).
 
 ```bash
 sudo airvpn-check --offline

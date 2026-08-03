@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Unit tests for endpoint parsing and deterministic interface naming.
 - CI workflows for lint, syntax, unit tests, and secret scanning.
 
+### Changed
+
+- Clarify static validation, Ansible check mode, live VM integration testing,
+  direct installation, and installed-state verification as distinct paths in
+  the README (with a first-time recommendation and links into
+  `docs/INTEGRATION_TESTING.md`).
+
 ### Fixed
 
 - Prompt for the Ansible become password from `bootstrap.sh` via
