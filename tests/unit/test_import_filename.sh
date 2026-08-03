@@ -41,6 +41,20 @@ else
   fail "import temporary security/cleanup markers missing"
 fi
 
+if grep -q 'airvpn_ensure_connection_inactive' "${IMPORT_SCRIPT}" &&
+  grep -q 'Failed to leave newly imported profile inactive' "${IMPORT_SCRIPT}"; then
+  pass "import ensures newly imported profiles become inactive"
+else
+  fail "import missing post-import inactivity enforcement"
+fi
+
+if grep -q 'airvpn_uuid_is_active' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh" &&
+  grep -q 'airvpn_ensure_connection_inactive' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh"; then
+  pass "common.sh provides exact UUID active-state helpers"
+else
+  fail "common.sh missing airvpn_uuid_is_active / ensure inactive helpers"
+fi
+
 # Deterministic ifname constraints for the long AirVPN fixture
 pubkey="$(airvpn_wg_field "${LONG_FIXTURE}" "PublicKey")"
 endpoint="$(airvpn_wg_field "${LONG_FIXTURE}" "Endpoint")"
@@ -91,6 +105,22 @@ STATE_DIR="${AIRVPN_TEST_STATE:?}"
 mkdir -p "${STATE_DIR}"
 printf '%s\n' "$*" >>"${STATE_DIR}/nmcli.argv"
 fail_mode="$(cat "${STATE_DIR}/nmcli.fail" 2>/dev/null || true)"
+: >>"${STATE_DIR}/active.uuids"
+: >>"${STATE_DIR}/import.counter"
+
+active_add() {
+  local u="$1"
+  if ! grep -qxF "${u}" "${STATE_DIR}/active.uuids" 2>/dev/null; then
+    printf '%s\n' "${u}" >>"${STATE_DIR}/active.uuids"
+  fi
+}
+
+active_del() {
+  local u="$1" tmp
+  tmp="$(mktemp)"
+  grep -vxF "${u}" "${STATE_DIR}/active.uuids" >"${tmp}" 2>/dev/null || true
+  mv "${tmp}" "${STATE_DIR}/active.uuids"
+}
 
 if [[ "${1:-}" == "-t" && "${2:-}" == "connection" && "${3:-}" == "import" ]]; then
   # argv: -t connection import type wireguard file PATH
@@ -103,6 +133,7 @@ if [[ "${1:-}" == "-t" && "${2:-}" == "connection" && "${3:-}" == "import" ]]; t
     fi
   done
   base="$(basename "${file}")"
+  printf '%s\n' "${base}" >>"${STATE_DIR}/import.basenames"
   printf '%s\n' "${base}" >"${STATE_DIR}/import.basename"
   printf '%s\n' "${file}" >"${STATE_DIR}/import.path"
   if [[ -n "${fail_mode}" && "${fail_mode}" == "import" ]]; then
@@ -127,10 +158,26 @@ if [[ "${1:-}" == "-t" && "${2:-}" == "connection" && "${3:-}" == "import" ]]; t
     printf "Connection '%s' successfully added.\n" "${stem}"
     exit 0
   fi
-  uuid="11111111-1111-4111-8111-111111111111"
+  n="$(cat "${STATE_DIR}/import.counter")"
+  n=$((n + 1))
+  printf '%s\n' "${n}" >"${STATE_DIR}/import.counter"
+  uuid="$(printf '11111111-1111-4111-8111-%012d' "${n}")"
   printf '%s\n' "${uuid}" >"${STATE_DIR}/imported.uuid"
   printf '%s\n' "${stem}" >"${STATE_DIR}/imported.name"
+  printf '%s\n' "${uuid}" >>"${STATE_DIR}/imported.uuids"
+  # Default: mimic Fedora NM WireGuard import auto-activation.
+  if [[ ! -f "${STATE_DIR}/import.leave_inactive" ]]; then
+    active_add "${uuid}"
+  fi
   printf "Connection '%s' (%s) successfully added.\n" "${stem}" "${uuid}"
+  exit 0
+fi
+
+if [[ "${1:-}" == "-t" && "${2:-}" == "-f" && "${3:-}" == "UUID,STATE" && "${4:-}" == "connection" && "${5:-}" == "show" && "${6:-}" == "--active" ]]; then
+  while IFS= read -r u; do
+    [[ -n "${u}" ]] || continue
+    printf '%s:activated\n' "${u}"
+  done <"${STATE_DIR}/active.uuids"
   exit 0
 fi
 
@@ -164,6 +211,21 @@ if [[ "${1:-}" == "connection" && "${2:-}" == "modify" ]]; then
     exit 1
   fi
   printf '%s\n' "$*" >>"${STATE_DIR}/nmcli.modify"
+  exit 0
+fi
+
+if [[ "${1:-}" == "connection" && "${2:-}" == "down" ]]; then
+  printf '%s\n' "$*" >>"${STATE_DIR}/nmcli.down"
+  # uuid is typically argv[3] for: connection down uuid UUID
+  down_uuid=""
+  if [[ "${3:-}" == "uuid" ]]; then
+    down_uuid="${4:-}"
+  fi
+  if [[ -n "${fail_mode}" && "${fail_mode}" == "down" ]]; then
+    printf 'Error: disconnect failed\n' >&2
+    exit 1
+  fi
+  [[ -n "${down_uuid}" ]] && active_del "${down_uuid}"
   exit 0
 fi
 
@@ -210,6 +272,8 @@ if [[ "${EUID}" -ne 0 ]]; then
 else
   # Successful long-name import
   rm -f "${state}"/*
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
   out="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
     "${IMPORT_SCRIPT}" --source "${src}" --mode add 2>&1)" || {
     fail "import long filename failed: ${out}"
@@ -251,12 +315,90 @@ else
     else
       pass "import output has no private key material"
     fi
+    if grep -q 'connection down uuid' "${state}/nmcli.down" 2>/dev/null &&
+      [[ ! -s "${state}/active.uuids" ]] &&
+      printf '%s' "${out}" | grep -q 'inactive'; then
+      pass "auto-activated import was disconnected and left inactive"
+    else
+      fail "post-import deactivation missing or profile still active"
+    fi
   fi
 
+  # Already-inactive import: no disconnect required
+  rm -rf "${TMPDIR:?}/"* "${state:?}/"*
+  mkdir -p "${TMPDIR}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
+  : >"${state}/import.leave_inactive"
+  out_inactive="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
+    "${IMPORT_SCRIPT}" --source "${src}" --mode add 2>&1)" || fail "inactive import failed: ${out_inactive}"
+  if [[ ! -f "${state}/nmcli.down" ]] && [[ ! -s "${state}/active.uuids" ]]; then
+    pass "already-inactive import skips connection down"
+  else
+    fail "already-inactive import unexpectedly called down or left active"
+  fi
+
+  # Two-profile import: A must be inactive before B is imported
+  SECOND_BASE="AirVPN_CH-Geneva_Hamal_UDP-1637-Entry3.conf"
+  install -m 0600 "${ROOT}/tests/fixtures/${SECOND_BASE}" "${src}/${SECOND_BASE}"
+  rm -rf "${TMPDIR:?}/"* "${state:?}/"* "${managed:?}/"*
+  mkdir -p "${TMPDIR}" "${managed}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
+  out_two="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
+    "${IMPORT_SCRIPT}" --source "${src}" --mode add 2>&1)" || fail "two-profile import failed: ${out_two}"
+  # Extract relative order from nmcli.argv
+  mapfile -t seq_lines < <(grep -E 'connection import|connection down' "${state}/nmcli.argv" || true)
+  # Expect: import, down, import, down (modify calls ignored)
+  order_ok=0
+  if ((${#seq_lines[@]} >= 4)); then
+    if [[ "${seq_lines[0]}" == *'connection import'* &&
+      "${seq_lines[1]}" == *'connection down'* &&
+      "${seq_lines[2]}" == *'connection import'* &&
+      "${seq_lines[3]}" == *'connection down'* ]]; then
+      order_ok=1
+    fi
+  fi
+  # Stronger: max active never >1 after each recorded down; final active empty
+  if ((order_ok == 1)) && [[ ! -s "${state}/active.uuids" ]] &&
+    [[ "$(grep -c 'connection import' "${state}/nmcli.argv")" == "2" ]]; then
+    pass "two-profile import disconnects each profile before the next import"
+  else
+    fail "two-profile import ordering/inactivity unexpected (lines=${#seq_lines[@]})"
+  fi
+
+  # Deactivation failure aborts before further imports and cleans temp
+  rm -rf "${TMPDIR:?}/"* "${state:?}/"* "${managed:?}/"*
+  mkdir -p "${TMPDIR}" "${managed}"
+  # Only first long-name config in source for this failure case
+  rm -f "${src}/${SECOND_BASE}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
+  printf 'down\n' >"${state}/nmcli.fail"
+  set +e
+  out_down="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
+    "${IMPORT_SCRIPT}" --source "${src}" --mode add 2>&1)"
+  rc_down=$?
+  set -e
+  leftover_down="$(find "${harness}" -type f -name "${ifname}.conf" 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "${rc_down}" -ne 0 && "${leftover_down}" == "0" ]] &&
+    printf '%s' "${out_down}" | grep -q 'Failed to leave newly imported profile inactive' &&
+    ! printf '%s' "${out_down}" | grep -qiE 'PrivateKey|AAAAAAAA'; then
+    pass "deactivation failure aborts import without leaking secrets"
+  else
+    fail "deactivation failure handling unexpected rc=${rc_down}"
+  fi
+  # Restore second fixture for later tests that may need only one file — keep single
+  # Restore long fixture only in src (already present)
+
   # Add mode: existing ifname refreshes managed copy without re-import
-  rm -f "${state}/import.basename" "${state}/nmcli.argv"
+  rm -f "${state}/import.basename" "${state}/nmcli.argv" "${state}/nmcli.fail" "${state}/nmcli.down"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
+  # Mark one managed VPN as intentionally active; add-mode refresh must not disconnect it.
+  printf '%s\n' "22222222-2222-4222-8222-222222222222" >"${state}/active.uuids"
   printf '%s\n' "${ifname}" >"${state}/existing.ifname"
-  printf '%s:%s:wireguard::\n' "22222222-2222-4222-8222-222222222222" "AirVPN - existing" >"${state}/list.managed"
+  printf '%s:%s:wireguard::activated\n' "22222222-2222-4222-8222-222222222222" "AirVPN - existing" >"${state}/list.managed"
   before_imports="$(grep -c 'connection import' "${state}/nmcli.argv" 2>/dev/null || true)"
   before_imports="${before_imports:-0}"
   out2="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
@@ -264,10 +406,12 @@ else
   after_imports="$(grep -c 'connection import' "${state}/nmcli.argv" 2>/dev/null || true)"
   after_imports="${after_imports:-0}"
   if [[ ! -f "${state}/import.basename" && "${before_imports}" == "${after_imports}" ]] &&
-    printf '%s' "${out2}" | grep -q 'already exists'; then
-    pass "add mode skips re-import when deterministic ifname exists"
+    printf '%s' "${out2}" | grep -q 'already exists' &&
+    [[ ! -f "${state}/nmcli.down" ]] &&
+    grep -qxF '22222222-2222-4222-8222-222222222222' "${state}/active.uuids"; then
+    pass "add mode skips re-import and does not disconnect existing active VPN"
   else
-    fail "add mode unexpectedly re-imported existing ifname (before=${before_imports} after=${after_imports})"
+    fail "add mode unexpectedly re-imported or disconnected existing ifname"
   fi
   if [[ -f "${managed}/${LONG_BASE}" ]]; then
     pass "add mode still refreshed managed copy"
@@ -278,6 +422,8 @@ else
   # Import failure cleanup
   rm -rf "${TMPDIR:?}/"* "${state:?}/"*
   mkdir -p "${TMPDIR}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
   printf 'import\n' >"${state}/nmcli.fail"
   set +e
   out3="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
@@ -299,6 +445,8 @@ else
   # UUID detection failure cleanup
   rm -rf "${TMPDIR:?}/"* "${state:?}/"*
   mkdir -p "${TMPDIR}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
   printf 'uuid\n' >"${state}/nmcli.fail"
   set +e
   out_uuid="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
@@ -315,6 +463,8 @@ else
   # Modify failure after successful import still cleans temp
   rm -rf "${TMPDIR:?}/"* "${state:?}/"*
   mkdir -p "${TMPDIR}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
   printf 'modify\n' >"${state}/nmcli.fail"
   set +e
   out4="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
@@ -328,18 +478,22 @@ else
     fail "modify failure cleanup rc=${rc4} leftover=${leftover4}"
   fi
 
-  # Replace mode: remove managed profiles then import via short temp name
+  # Replace mode: remove managed profiles then import via short temp name; leave inactive
   rm -rf "${TMPDIR:?}/"* "${state:?}/"*
   mkdir -p "${TMPDIR}"
+  printf '0\n' >"${state}/import.counter"
+  : >"${state}/active.uuids"
   printf '%s:%s:wireguard::\n' "33333333-3333-4333-8333-333333333333" "AirVPN - old" >"${state}/list.managed"
   printf '%s\n' "${ifname}" >"${state}/existing.ifname"
   out_rep="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
     "${IMPORT_SCRIPT}" --source "${src}" --mode replace 2>&1)" || fail "replace mode failed: ${out_rep}"
   if grep -q 'connection delete' "${state}/nmcli.delete" 2>/dev/null &&
-    [[ "$(cat "${state}/import.basename" 2>/dev/null || true)" == "${ifname}.conf" ]]; then
-    pass "replace mode deletes managed profile and imports short basename"
+    [[ "$(cat "${state}/import.basename" 2>/dev/null || true)" == "${ifname}.conf" ]] &&
+    grep -q 'connection down uuid' "${state}/nmcli.down" 2>/dev/null &&
+    [[ ! -s "${state}/active.uuids" ]]; then
+    pass "replace mode deletes managed profile, imports short basename, leaves inactive"
   else
-    fail "replace mode delete/import behavior unexpected"
+    fail "replace mode delete/import/inactive behavior unexpected"
   fi
 
   # Dry-run mentions short import basename, not long managed path import
@@ -347,8 +501,9 @@ else
   dry="$(AIRVPN_CONFIG_DIR="${cfgdir}" \
     "${IMPORT_SCRIPT}" --source "${src}" --mode add --dry-run 2>&1)" || fail "dry-run failed"
   if printf '%s\n' "${dry}" | grep -q "${ifname}.conf" &&
+    printf '%s\n' "${dry}" | grep -q 'ensure imported profile inactive' &&
     ! printf '%s\n' "${dry}" | grep -q "wireguard file ${managed}/${LONG_BASE}"; then
-    pass "dry-run shows deterministic import basename"
+    pass "dry-run shows deterministic import basename and inactivity step"
   else
     fail "dry-run import path messaging unexpected"
   fi

@@ -79,6 +79,13 @@ endpoint discovery, and imports through a private temporary file named
 `<deterministic-ifname>.conf` (mode `0600` under a `0700` directory). Temporary
 key material is removed on success and failure. Source files are never renamed.
 
+Installation imports managed profiles but leaves them **inactive** with
+`autoconnect` disabled. NetworkManager may activate a profile during WireGuard
+import; `airvpn-import` disconnects each newly imported profile and verifies
+inactivity before continuing. Explicit activation remains `airvpn-switch`.
+Offline verification fails if more than one managed VPN is active; a clean
+install should report zero active managed VPNs.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and

@@ -177,6 +177,7 @@ import_one() {
   if ((DRY_RUN)); then
     printf 'DRY-RUN: nmcli connection import type wireguard file <private-temp>/%s.conf\n' "${ifname}"
     printf 'DRY-RUN: rename to %s, ifname %s, zone %s\n' "${conn_name}" "${ifname}" "${AIRVPN_ZONE}"
+    printf 'DRY-RUN: ensure imported profile inactive (NM may auto-activate on import)\n'
     return 0
   fi
 
@@ -235,9 +236,18 @@ import_one() {
     trap - RETURN
     airvpn_die "Failed to harden imported connection for ${base}"
   fi
+  # NetworkManager WireGuard import may activate the profile immediately.
+  # autoconnect=no only affects future boots; disconnect now so multi-profile
+  # imports cannot accumulate active tunnels before offline verification.
+  # On failure: leave the profile present (do not delete) and abort further imports.
+  if ! airvpn_ensure_connection_inactive "${imported_uuid}" "${conn_name}" 45; then
+    cleanup_import_tmpdir
+    trap - RETURN
+    airvpn_die "Failed to leave newly imported profile inactive: ${conn_name} (${imported_uuid})"
+  fi
   cleanup_import_tmpdir
   trap - RETURN
-  airvpn_log "INFO" "Imported ${conn_name} (uuid=${imported_uuid}, ifname=${ifname})"
+  airvpn_log "INFO" "Imported ${conn_name} (uuid=${imported_uuid}, ifname=${ifname}, inactive)"
 }
 
 main_import() {

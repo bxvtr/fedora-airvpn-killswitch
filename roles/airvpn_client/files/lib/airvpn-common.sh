@@ -293,15 +293,28 @@ airvpn_count_active_managed() {
   printf '%s' "${count}"
 }
 
+# True if UUID appears in nmcli's machine-readable active connection list.
+airvpn_uuid_is_active() {
+  local uuid="$1"
+  local line active_uuid
+  [[ -n "${uuid}" ]] || return 1
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    active_uuid="${line%%:*}"
+    if [[ "${active_uuid}" == "${uuid}" ]]; then
+      return 0
+    fi
+  done < <(nmcli -t -f UUID,STATE connection show --active 2>/dev/null || true)
+  return 1
+}
+
 # Wait until a connection UUID is fully inactive.
 airvpn_wait_inactive() {
   local uuid="$1"
   local timeout="${2:-30}"
-  local i state
+  local i
   for ((i = 0; i < timeout; i++)); do
-    state="$(nmcli -t -f GENERAL.STATE connection show "${uuid}" 2>/dev/null | cut -d: -f2- || true)"
-    # Inactive connections often have empty GENERAL.STATE or report as such via device
-    if ! nmcli -t -f UUID,STATE connection show --active 2>/dev/null | grep -q "^${uuid}:"; then
+    if ! airvpn_uuid_is_active "${uuid}"; then
       return 0
     fi
     sleep 1
@@ -312,14 +325,34 @@ airvpn_wait_inactive() {
 airvpn_wait_active() {
   local uuid="$1"
   local timeout="${2:-45}"
-  local i
+  local i line active_uuid state
   for ((i = 0; i < timeout; i++)); do
-    if nmcli -t -f UUID,STATE connection show --active 2>/dev/null | grep -q "^${uuid}:activated$"; then
-      return 0
-    fi
+    while IFS= read -r line; do
+      [[ -n "${line}" ]] || continue
+      active_uuid="${line%%:*}"
+      state="${line#*:}"
+      if [[ "${active_uuid}" == "${uuid}" && "${state}" == "activated" ]]; then
+        return 0
+      fi
+    done < <(nmcli -t -f UUID,STATE connection show --active 2>/dev/null || true)
     sleep 1
   done
   return 1
+}
+
+# If UUID is active, disconnect and wait until inactive. Returns non-zero on
+# disconnect or wait failure. Does not delete the profile (callers decide).
+airvpn_ensure_connection_inactive() {
+  local uuid="$1"
+  local label="${2:-$1}"
+  local timeout="${3:-45}"
+  if airvpn_uuid_is_active "${uuid}"; then
+    airvpn_log "INFO" "Disconnecting active connection ${label} (${uuid})"
+    if ! nmcli connection down uuid "${uuid}"; then
+      return 1
+    fi
+  fi
+  airvpn_wait_inactive "${uuid}" "${timeout}"
 }
 
 # Return latest handshake age in seconds for interface, or empty if unavailable.

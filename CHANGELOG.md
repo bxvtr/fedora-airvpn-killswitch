@@ -18,6 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Leave newly imported WireGuard profiles inactive: NetworkManager may
+  auto-activate on `connection import`; `autoconnect no` alone does not
+  disconnect an already-active tunnel. Disconnect and verify inactivity
+  before importing the next profile or finishing install.
 - Import WireGuard profiles through a private temporary file named
   `<deterministic-ifname>.conf` so NetworkManager accepts long AirVPN
   source basenames; keep the original basename on the managed copy.

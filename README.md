@@ -16,6 +16,7 @@ THE SOFTWARE IS PROVIDED **WITHOUT WARRANTY**. Users must verify behavior on the
 - During VPN server switches, ordinary Internet traffic remains blocked.
 - If WireGuard activation or handshake verification fails, the system fails closed.
 - After boot, before manual VPN activation, ordinary Internet traffic is blocked (managed profiles have `autoconnect` disabled).
+- Installation imports managed AirVPN profiles but leaves them inactive; activate one explicitly with `airvpn-switch`.
 - After suspend/resume, traffic either continues through an still-active VPN or remains blocked.
 - Physical Wi-Fi/Ethernet may send only required WireGuard handshake traffic to explicitly allowed numeric AirVPN endpoints (plus minimal DHCP/NDP allowances).
 - Traffic via the managed AirVPN interface is allowed.
