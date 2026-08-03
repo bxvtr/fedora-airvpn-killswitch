@@ -256,7 +256,7 @@ check_unsafe_physical() {
 
     applicable=()
     set +e
-    mapfile -t applicable < <(airvpn_list_applicable_runtime_devices "${devices_field}")
+    airvpn_fill_applicable_runtime_devices applicable "${devices_field}"
     list_rc=$?
     set -e
     if ((list_rc != 0)); then

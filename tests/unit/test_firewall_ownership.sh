@@ -314,6 +314,44 @@ out="$(airvpn_list_applicable_runtime_devices 'wg0')" || rc=$?
 [[ "${rc}" -ne 0 && "${out}" == "wg0" ]] &&
   pass "list unexpected virtual fails" || fail "list wg out=${out} rc=${rc}"
 
+# Mixed physical+virtual: nameref fill must preserve helper failure (mapfile does not).
+applicable=()
+rc=0
+airvpn_fill_applicable_runtime_devices applicable 'wlp3s0,wg0' || rc=$?
+[[ "${rc}" -ne 0 && "${applicable[0]}" == "wg0" && "${#applicable[@]}" -eq 1 ]] &&
+  pass "fill mixed physical+virtual fails on unexpected" ||
+  fail "fill mixed rc=${rc} arr=${applicable[*]}"
+
+applicable=()
+rc=0
+airvpn_fill_applicable_runtime_devices applicable 'wg0,wlp3s0' || rc=$?
+[[ "${rc}" -ne 0 && "${applicable[0]}" == "wg0" ]] &&
+  pass "fill unexpected-first still fails" ||
+  fail "fill unexpected-first rc=${rc} arr=${applicable[*]}"
+
+applicable=()
+rc=0
+airvpn_fill_applicable_runtime_devices applicable 'wlp3s0,--,lo' || rc=$?
+[[ "${rc}" -eq 0 && "${#applicable[@]}" -eq 1 && "${applicable[0]}" == "wlp3s0" ]] &&
+  pass "fill valid plus placeholders" ||
+  fail "fill placeholders rc=${rc} arr=${applicable[*]}"
+
+# Guard: mapfile+process-substitution hides helper rc (must not be reintroduced in callers).
+mapfile -t applicable < <(airvpn_list_applicable_runtime_devices 'wlp3s0,wg0')
+map_rc=$?
+if [[ "${map_rc}" -eq 0 && "${applicable[0]}" == "wg0" ]]; then
+  pass "mapfile hides helper rc (callers must use airvpn_fill_*)"
+else
+  fail "mapfile pitfall probe unexpected map_rc=${map_rc} arr=${applicable[*]}"
+fi
+if ! grep -n 'mapfile -t applicable < <(airvpn_list_applicable_runtime_devices' \
+  "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh" \
+  "${ROOT}/roles/airvpn_client/files/airvpn-check"; then
+  pass "callers no longer use mapfile with list_applicable helper"
+else
+  fail "mapfile+list_applicable still present in callers"
+fi
+
 # Active connection with only skipped devices must fail closed (unit-level contract)
 if grep -q 'reason=no-applicable-device' "${ROOT}/roles/airvpn_client/files/lib/airvpn-common.sh" &&
   grep -q 'has no applicable device for runtime zone check' "${ROOT}/roles/airvpn_client/files/airvpn-check"; then

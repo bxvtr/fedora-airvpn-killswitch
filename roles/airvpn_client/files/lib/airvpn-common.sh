@@ -639,21 +639,24 @@ airvpn_classify_runtime_zone_device() {
   esac
 }
 
-# Expand a GENERAL.DEVICES field into applicable device names (one per line).
-# Args: devices_field (comma- or space-separated)
-# On unexpected virtual devices: print that device name and return 1.
-# On success: print applicable devices (possibly none) and return 0.
-airvpn_list_applicable_runtime_devices() {
-  local devices_field="${1:-}"
+# Fill a nameref array with applicable device names from a GENERAL.DEVICES field.
+# Args: nameref_array_name devices_field
+# On unexpected virtual device: array contains that name only; return 1.
+# On success: array contains applicable devices (possibly empty); return 0.
+# Prefer this over mapfile+process-substitution: mapfile's $? is not the helper rc.
+airvpn_fill_applicable_runtime_devices() {
+  local -n _airvpn_dev_out="$1"
+  local devices_field="${2:-}"
   local devices device kind
   local -a good=()
+  _airvpn_dev_out=()
   devices="${devices_field//,/ }"
   for device in ${devices}; do
     kind="$(airvpn_classify_runtime_zone_device "${device}")"
     case "${kind}" in
       skip) continue ;;
       unexpected)
-        printf '%s\n' "${device}"
+        _airvpn_dev_out=("${device}")
         return 1
         ;;
       applicable)
@@ -662,9 +665,24 @@ airvpn_list_applicable_runtime_devices() {
     esac
   done
   if ((${#good[@]} > 0)); then
-    printf '%s\n' "${good[@]}"
+    _airvpn_dev_out=("${good[@]}")
   fi
   return 0
+}
+
+# Expand a GENERAL.DEVICES field into applicable device names (one per line).
+# Args: devices_field (comma- or space-separated)
+# On unexpected virtual devices: print that device name and return 1.
+# On success: print applicable devices (possibly none) and return 0.
+airvpn_list_applicable_runtime_devices() {
+  local devices_field="${1:-}"
+  local -a devices_out=()
+  local rc=0
+  airvpn_fill_applicable_runtime_devices devices_out "${devices_field}" || rc=$?
+  if ((${#devices_out[@]} > 0)); then
+    printf '%s\n' "${devices_out[@]}"
+  fi
+  return "${rc}"
 }
 
 # If connection UUID is active, reapply its device(s) and require the runtime
@@ -699,8 +717,9 @@ airvpn_ensure_runtime_zone() {
     return 1
   fi
 
+  applicable=()
   set +e
-  mapfile -t applicable < <(airvpn_list_applicable_runtime_devices "${devices_field}")
+  airvpn_fill_applicable_runtime_devices applicable "${devices_field}"
   list_rc=$?
   set -e
   if ((list_rc != 0)); then
