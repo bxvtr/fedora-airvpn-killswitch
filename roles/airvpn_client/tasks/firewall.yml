@@ -1,21 +1,26 @@
 ---
-# Create project zones and HOST->zone policy objects via firewall-cmd.
+# Create project zones and HOST->zone policy objects.
 # ansible.posix.firewalld manages zones but has no policy-object module in
 # ansible.posix 2.2.2, so policies use firewall-cmd with changed_when checks.
+#
+# Zone create/delete transactions must be permanent-only. Combining
+# permanent=true with immediate=true fails in ansible.posix.firewalld 2.2.2
+# ("Zone operations must be permanent"). Runtime activation uses an explicit
+# firewalld reload after permanent zone and policy changes.
 
-- name: Ensure airvpn firewalld zone exists
+- name: Ensure airvpn firewalld zone exists permanently
   ansible.posix.firewalld:
     zone: "{{ airvpn_zone }}"
     state: present
     permanent: true
-    immediate: true
+  register: airvpn_zone_airvpn
 
-- name: Ensure underlay firewalld zone exists
+- name: Ensure underlay firewalld zone exists permanently
   ansible.posix.firewalld:
     zone: "{{ airvpn_underlay_zone }}"
     state: present
     permanent: true
-    immediate: true
+  register: airvpn_zone_underlay
 
 - name: Check whether VPN policy exists
   ansible.builtin.command:
@@ -112,12 +117,14 @@
     cmd: firewall-cmd --check-config
   changed_when: false
 
-- name: Reload firewalld to activate zones and policies
+- name: Reload firewalld to activate permanent zones and policies
   ansible.builtin.command:
     cmd: firewall-cmd --reload
   register: airvpn_fw_reload
   changed_when: airvpn_fw_reload.rc == 0
   when: >-
+    (airvpn_zone_airvpn is changed) or
+    (airvpn_zone_underlay is changed) or
     (airvpn_pol_vpn_create is changed) or
     (airvpn_pol_underlay_create is changed) or
     (airvpn_pol_vpn_ingress is changed) or

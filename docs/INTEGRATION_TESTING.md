@@ -42,6 +42,16 @@ Expect:
 interactive `sudo` prompt from the runner does **not** replace Ansible's become
 prompt.
 
+## Firewalld zone lifecycle notes
+
+Project zones (`airvpn`, `vpn-underlay`) are created and deleted with
+`ansible.posix.firewalld` using **permanent-only** semantics. Zone transactions
+must not set `immediate: true` (firewalld / ansible.posix limitation). A
+`firewall-cmd --reload` after permanent zone and policy changes activates the
+runtime configuration. Check mode remains advisory: it does not prove live
+firewalld enforcement. After a failed partial install in the VM, prefer
+restoring the snapshot.
+
 ## Purpose of the live VM test
 
 `tools/integration-test-vm` orchestrates the project's existing playbooks and

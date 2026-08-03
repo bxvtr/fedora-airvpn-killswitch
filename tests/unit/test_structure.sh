@@ -153,6 +153,131 @@ else
   fail "uninstall policy deletion failed_when must accept NOT_ENABLED and INVALID_POLICY"
 fi
 
+# Zone create/delete must be permanent-only (ansible.posix.firewalld ZoneTransaction).
+fw_yml="${ROOT}/roles/airvpn_client/tasks/firewall.yml"
+set +e
+ROOT_DIR="${ROOT}" python3 - <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+import yaml
+
+root = Path(os.environ["ROOT_DIR"])
+fw = yaml.safe_load((root / "roles/airvpn_client/tasks/firewall.yml").read_text())
+un = yaml.safe_load((root / "playbooks/uninstall.yml").read_text())
+
+
+def zone_tasks(docs):
+    out = []
+    items = docs
+    if isinstance(docs, list) and docs and isinstance(docs[0], dict) and "tasks" in docs[0]:
+        items = docs[0]["tasks"]
+    elif isinstance(docs, list):
+        items = docs
+    else:
+        items = []
+    for t in items:
+        if not isinstance(t, dict):
+            continue
+        mod = t.get("ansible.posix.firewalld")
+        if isinstance(mod, dict) and "zone" in mod and "state" in mod:
+            out.append((t.get("name"), mod))
+    return out
+
+
+fails = 0
+for name, mod in zone_tasks(fw):
+    if mod.get("permanent") is not True:
+        print(f"FAIL install zone task not permanent: {name} {mod}")
+        fails += 1
+    if "immediate" in mod and mod.get("immediate") is not False:
+        print(f"FAIL install zone task sets immediate: {name} {mod}")
+        fails += 1
+    if mod.get("state") != "present":
+        print(f"FAIL install zone unexpected state: {name} {mod}")
+        fails += 1
+
+if len(zone_tasks(fw)) < 2:
+    print("FAIL expected two install zone tasks")
+    fails += 1
+
+for name, mod in zone_tasks(un):
+    if mod.get("state") != "absent":
+        continue
+    if mod.get("permanent") is not True:
+        print(f"FAIL uninstall zone task not permanent: {name} {mod}")
+        fails += 1
+    if "immediate" in mod and mod.get("immediate") is not False:
+        print(f"FAIL uninstall zone task sets immediate: {name} {mod}")
+        fails += 1
+
+un_tasks = un[0]["tasks"]
+names = [t.get("name", "") for t in un_tasks if isinstance(t, dict)]
+try:
+    i_pol = next(i for i, n in enumerate(names) if "Remove project firewalld policies" in n)
+    i_zone = next(i for i, n in enumerate(names) if "Remove project firewalld zones" in n)
+except StopIteration:
+    print("FAIL uninstall policy/zone removal tasks missing")
+    fails += 1
+else:
+    if i_pol >= i_zone:
+        print("FAIL uninstall must remove policies before zones")
+        fails += 1
+
+fw_text = (root / "roles/airvpn_client/tasks/firewall.yml").read_text()
+if "airvpn_zone_airvpn is changed" not in fw_text or "airvpn_zone_underlay is changed" not in fw_text:
+    print("FAIL reload when-clause must include zone creation changes")
+    fails += 1
+if "immediate: true" in fw_text:
+    print("FAIL firewall.yml still contains immediate: true")
+    fails += 1
+
+un_text = (root / "playbooks/uninstall.yml").read_text()
+m = re.search(
+    r"Remove project firewalld zones if present.*?Reload firewalld after uninstall",
+    un_text,
+    re.S,
+)
+if not m:
+    print("FAIL could not locate uninstall zone removal block")
+    fails += 1
+elif "immediate:" in m.group(0):
+    print("FAIL uninstall zone removal still sets immediate")
+    fails += 1
+
+for path in [fw_text, un_text]:
+    for bad in ["--complete-reload", "--panic-off", "nft flush", "iptables -F"]:
+        if bad in path:
+            print(f"FAIL forbidden firewall reset pattern: {bad}")
+            fails += 1
+
+sys.exit(1 if fails else 0)
+PY
+zone_rc=$?
+set -e
+if [[ "${zone_rc}" -eq 0 ]]; then
+  pass "firewalld zone tasks use permanent-only semantics with ordered reload"
+else
+  fail "firewalld zone permanent/immediate semantics invalid"
+fi
+
+# Policy targets remain fail-closed
+if grep -q 'set-target=ACCEPT' "${fw_yml}" && grep -q 'set-target=REJECT' "${fw_yml}"; then
+  pass "VPN policy ACCEPT and underlay REJECT targets remain"
+else
+  fail "fail-closed policy targets missing"
+fi
+
+# Policies still removed before zones; only project zone names
+if grep -A12 'Remove project firewalld zones if present' "${uninstall}" | grep -q 'airvpn_zone' &&
+  grep -A12 'Remove project firewalld zones if present' "${uninstall}" | grep -q 'airvpn_underlay_zone' &&
+  ! grep -A12 'Remove project firewalld zones if present' "${uninstall}" | grep -qE 'FedoraWorkstation|public|allow-host-ipv6'; then
+  pass "uninstall removes only project zones after policies"
+else
+  fail "uninstall zone removal targets unexpected"
+fi
+
 nm_yml="${ROOT}/roles/airvpn_client/tasks/networkmanager.yml"
 if grep -q 'airvpn_ensure_runtime_zone' "${nm_yml}" &&
   grep -q 'Reapply underlay zone on active physical interfaces' "${nm_yml}"; then

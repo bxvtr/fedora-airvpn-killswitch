@@ -142,12 +142,12 @@
              and 'INVALID_POLICY' not in (airvpn_del_policy.stdout | default(''))
              and 'INVALID_POLICY' not in (airvpn_del_policy.stderr | default('')))
 
+    # Zone delete transactions must be permanent-only (no immediate=true).
     - name: Remove project firewalld zones if present
       ansible.posix.firewalld:
         zone: "{{ item }}"
         state: absent
         permanent: true
-        immediate: true
       loop:
         - "{{ airvpn_zone }}"
         - "{{ airvpn_underlay_zone }}"
