@@ -50,12 +50,14 @@ it_validate_option_combo() {
 }
 
 # Select first/second profile names from a newline-separated managed list.
-# Args: list_text first_hint second_hint
+# Args: list_text first_hint second_hint [require_second=0|1]
 # Prints "first|second" or returns 1.
+# When require_second=1, fails unless a distinct second profile is available.
 it_select_profiles() {
   local list_text="$1"
   local first_hint="${2:-}"
   local second_hint="${3:-}"
+  local require_second="${4:-0}"
   local -a names=()
   local line
 
@@ -100,6 +102,79 @@ it_select_profiles() {
     done
   fi
 
+  if [[ "${require_second}" == "1" || "${require_second}" == "true" ]]; then
+    [[ -n "${second}" && "${second}" != "${first}" ]] || return 1
+  fi
+
   printf '%s|%s\n' "${first}" "${second:-}"
   return 0
+}
+
+# Count active managed VPN profiles from nmcli terse UUID,NAME,TYPE,DEVICE,STATE
+# lines using escape-aware splitting (requires airvpn_nmcli_split_terse).
+# Args: prefix nmcli_text
+it_count_active_managed_from_terse() {
+  local prefix="$1"
+  local text="$2"
+  local count=0
+  local line name state
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 5)) || continue
+    name="${AIRVPN_NM_FIELDS[1]}"
+    state="${AIRVPN_NM_FIELDS[4]}"
+    [[ "${name}" == "${prefix}"* ]] || continue
+    if [[ "${state}" == "activated" || "${state}" == "activating" ]]; then
+      count=$((count + 1))
+    fi
+  done <<<"${text}"
+  printf '%s\n' "${count}"
+}
+
+# List managed profile names from the same terse nmcli format.
+# Args: prefix nmcli_text
+it_managed_names_from_terse() {
+  local prefix="$1"
+  local text="$2"
+  local line name
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 2)) || continue
+    name="${AIRVPN_NM_FIELDS[1]}"
+    [[ "${name}" == "${prefix}"* ]] || continue
+    printf '%s\n' "${name}"
+  done <<<"${text}"
+}
+
+# Classify firewall-cmd --info-* results when the object is expected to be absent.
+# Args: exit_code output_text
+# Prints: present | absent | error
+# Non-zero exits that are not clearly "missing object" are error (fail closed),
+# so sudo/auth failures are not treated as successful removal.
+it_classify_firewall_info_absence() {
+  local rc="${1:-1}"
+  local out="${2:-}"
+
+  if [[ "${rc}" == "0" ]]; then
+    printf 'present\n'
+    return 0
+  fi
+  # Privilege / tool failures must never look like successful removal.
+  if grep -qiE \
+    'a password is required|^sudo:|Authentication failure|permission denied|command not found' \
+    <<<"${out}"; then
+    printf 'error\n'
+    return 0
+  fi
+  if grep -qiE \
+    'NOT_ENABLED|INVALID_ZONE|INVALID_POLICY|does not exist|not present' \
+    <<<"${out}"; then
+    printf 'absent\n'
+    return 0
+  fi
+  printf 'error\n'
 }

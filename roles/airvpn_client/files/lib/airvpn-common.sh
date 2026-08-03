@@ -532,3 +532,134 @@ airvpn_is_truthy() {
     *) return 1 ;;
   esac
 }
+
+# Return 0 when a firewall-cmd delete/info failure indicates the object is already gone.
+# Args: combined stdout+stderr text
+airvpn_firewall_absence_ok() {
+  local out="${1:-}"
+  grep -qiE 'NOT_ENABLED|INVALID_POLICY|INVALID_ZONE|does not exist|not present' <<<"${out}"
+}
+
+# Build expected underlay endpoint rich rules from family|ip|port lines on stdin.
+airvpn_rules_from_endpoint_keys() {
+  local line family ip port
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    IFS='|' read -r family ip port <<<"${line}"
+    [[ -n "${family}" && -n "${ip}" && -n "${port}" ]] || continue
+    airvpn_endpoint_rich_rule "${family}" "${ip}" "${port}"
+    printf '\n'
+  done
+}
+
+# Evaluate coverage of expected endpoint keys against listed rich rules.
+# Args: expected_keys_text current_rules_text
+# Prints summary lines:
+#   missing=<n> stale=<n> covered=<n> unrelated_udp=<n>
+#   MISSING <rule>
+#   STALE <rule>
+# Exit 0 iff missing=0 and stale=0.
+airvpn_eval_endpoint_rule_coverage() {
+  local expected_keys="$1"
+  local current_rules="$2"
+  local -A want=()
+  local -A have_project=()
+  local line rule family ip port missing=0 stale=0 covered=0 unrelated=0
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    IFS='|' read -r family ip port <<<"${line}"
+    [[ -n "${family}" && -n "${ip}" && -n "${port}" ]] || continue
+    rule="$(airvpn_endpoint_rich_rule "${family}" "${ip}" "${port}")"
+    want["${rule}"]=1
+  done <<<"${expected_keys}"
+
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    if airvpn_validate_endpoint_rich_rule "${line}"; then
+      have_project["${line}"]=1
+    elif grep -q 'protocol="udp"' <<<"${line}"; then
+      unrelated=$((unrelated + 1))
+    fi
+  done <<<"${current_rules}"
+
+  if ((${#want[@]} > 0)); then
+    for rule in "${!want[@]}"; do
+      if [[ -n "${have_project[${rule}]+x}" ]]; then
+        covered=$((covered + 1))
+      else
+        missing=$((missing + 1))
+        printf 'MISSING %s\n' "${rule}"
+      fi
+    done
+  fi
+  if ((${#have_project[@]} > 0)); then
+    for rule in "${!have_project[@]}"; do
+      if [[ -z "${want[${rule}]+x}" ]]; then
+        stale=$((stale + 1))
+        printf 'STALE %s\n' "${rule}"
+      fi
+    done
+  fi
+  printf 'missing=%s stale=%s covered=%s unrelated_udp=%s\n' \
+    "${missing}" "${stale}" "${covered}" "${unrelated}"
+  ((missing == 0 && stale == 0))
+}
+
+# If connection UUID is active, reapply its device(s) and require the runtime
+# firewalld zone to match want_zone. Inactive connections return 0 (profile-only).
+# Args: uuid want_zone
+# Prints machine-readable status lines on stdout for Ansible capture; logs on stderr.
+airvpn_ensure_runtime_zone() {
+  local uuid="$1"
+  local want_zone="$2"
+  local line active=0 devices device zone
+
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    airvpn_nmcli_split_terse "${line}"
+    ((${#AIRVPN_NM_FIELDS[@]} >= 1)) || continue
+    if [[ "${AIRVPN_NM_FIELDS[0]}" == "${uuid}" ]]; then
+      active=1
+      break
+    fi
+  done < <(nmcli -t -f UUID connection show --active 2>/dev/null || true)
+
+  if ((active == 0)); then
+    printf 'inactive uuid=%s\n' "${uuid}"
+    return 0
+  fi
+
+  devices="$(nmcli -g GENERAL.DEVICES connection show "${uuid}" 2>/dev/null || true)"
+  devices="${devices//,/ }"
+  if [[ -z "${devices}" || "${devices}" == "--" ]]; then
+    airvpn_log "ERROR" "Active connection ${uuid} has no device; cannot bind firewall zone ${want_zone}"
+    printf 'error uuid=%s reason=no-device\n' "${uuid}"
+    return 1
+  fi
+
+  for device in ${devices}; do
+    [[ -n "${device}" && "${device}" != "--" && "${device}" != "lo" ]] || continue
+    case "${device}" in
+      veth* | docker* | br-* | virbr* | tun* | tap* | wg*)
+        airvpn_log "ERROR" "Refusing runtime zone apply on unexpected device ${device}"
+        printf 'error uuid=%s device=%s reason=unexpected-device\n' "${uuid}" "${device}"
+        return 1
+        ;;
+    esac
+    if ! nmcli device reapply "${device}"; then
+      airvpn_log "ERROR" "nmcli device reapply ${device} failed for ${uuid}"
+      printf 'error uuid=%s device=%s reason=reapply-failed\n' "${uuid}" "${device}"
+      return 1
+    fi
+    zone="$(firewall-cmd --get-zone-of-interface="${device}" 2>/dev/null || true)"
+    if [[ "${zone}" != "${want_zone}" ]]; then
+      airvpn_log "ERROR" "Interface ${device} runtime zone is '${zone:-unset}', expected '${want_zone}'"
+      printf 'error uuid=%s device=%s runtime_zone=%s expected=%s\n' \
+        "${uuid}" "${device}" "${zone:-unset}" "${want_zone}"
+      return 1
+    fi
+    printf 'applied uuid=%s device=%s zone=%s\n' "${uuid}" "${device}" "${zone}"
+  done
+  return 0
+}

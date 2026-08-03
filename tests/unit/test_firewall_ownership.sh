@@ -198,6 +198,65 @@ else
   fail "already-in-sync path must require needs_reload == 0"
 fi
 
+# --- Exact endpoint coverage evaluation (no live firewalld) ---
+cov4="$(airvpn_endpoint_rich_rule ipv4 192.0.2.10 1637)"
+cov6="$(airvpn_endpoint_rich_rule ipv6 2001:db8::10 1637)"
+wrong_port="$(airvpn_endpoint_rich_rule ipv4 192.0.2.10 9999)"
+wrong_dest="$(airvpn_endpoint_rich_rule ipv4 198.51.100.1 1637)"
+broad='rule protocol="udp" accept'
+admin_udp='rule family="ipv4" source address="192.0.2.50" port port="53" protocol="udp" accept'
+keys=$'ipv4|192.0.2.10|1637\nipv6|2001:db8::10|1637'
+
+out=""
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage "${keys}" "$(printf '%s\n' "${cov4}" "${cov6}")")" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == *"covered=2"* && "${out}" == *"missing=0"* && "${out}" == *"stale=0"* ]] &&
+  pass "exact IPv4+IPv6 endpoint match" || fail "exact match out=${out} rc=${rc}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage "${keys}" "$(printf '%s\n' "${cov4}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"MISSING ${cov6}"* ]] && pass "missing IPv6 endpoint detected" || fail "missing out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637' "$(printf '%s\n' "${wrong_port}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"MISSING ${cov4}"* && "${out}" == *"STALE ${wrong_port}"* ]] &&
+  pass "wrong port detected as missing+stale" || fail "wrong port out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637' "$(printf '%s\n' "${wrong_dest}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"MISSING ${cov4}"* && "${out}" == *"STALE ${wrong_dest}"* ]] &&
+  pass "wrong destination detected" || fail "wrong dest out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637' "$(printf '%s\n' "${broad}" "${admin_udp}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"unrelated_udp=2"* && "${out}" == *"missing=1"* && "${out}" != *"STALE ${broad}"* ]] &&
+  pass "broad/unrelated UDP rules do not satisfy coverage" || fail "broad out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637' "$(printf '%s\n' "${cov4}" "${cov6}")")" || rc=$?
+[[ "${rc}" -ne 0 && "${out}" == *"STALE ${cov6}"* ]] && pass "stale project rule detected" || fail "stale out=${out}"
+
+rc=0
+out="$(airvpn_eval_endpoint_rule_coverage $'ipv4|192.0.2.10|1637\nipv4|198.51.100.20|51820' \
+  "$(printf '%s\n' "${cov4}" "$(airvpn_endpoint_rich_rule ipv4 198.51.100.20 51820)")")" || rc=$?
+[[ "${rc}" -eq 0 && "${out}" == *"covered=2"* ]] && pass "multiple managed endpoints covered" || fail "multi out=${out}"
+
+if airvpn_firewall_absence_ok 'Error: INVALID_POLICY: x' &&
+  airvpn_firewall_absence_ok 'NOT_ENABLED' &&
+  ! airvpn_firewall_absence_ok 'sudo: a password is required'; then
+  pass "firewall absence classifier for uninstall delete-policy"
+else
+  fail "firewall absence classifier"
+fi
+
+# airvpn-check documents IPv6 DNS expectations when enabled
+if grep -q 'ipv6.dns-priority' "${ROOT}/roles/airvpn_client/files/airvpn-check" &&
+  grep -q 'ipv6.method disabled' "${ROOT}/roles/airvpn_client/files/airvpn-check"; then
+  pass "airvpn-check covers ipv6 DNS enabled and disabled paths"
+else
+  fail "airvpn-check ipv6 DNS path coverage missing"
+fi
+
 echo
 if ((FAILS > 0)); then
   echo "FIREWALL OWNERSHIP TESTS FAILED: ${FAILS}"

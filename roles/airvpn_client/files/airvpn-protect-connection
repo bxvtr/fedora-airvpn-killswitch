@@ -25,7 +25,7 @@ fi
 
 airvpn_load_config
 airvpn_require_root
-airvpn_require_cmds nmcli flock
+airvpn_require_cmds nmcli flock firewall-cmd
 
 protect_main() {
   local line uuid name
@@ -59,8 +59,10 @@ protect_main() {
 
   # Do not touch loopback or bridge-like types (already filtered by type).
   nmcli connection modify uuid "${UUID}" connection.zone "${AIRVPN_UNDERLAY_ZONE}"
-  airvpn_log "INFO" "Protected '${NAME}' (${UUID}) -> zone ${AIRVPN_UNDERLAY_ZONE}"
-  airvpn_log "INFO" "Re-activate the connection if it is currently up for the zone to apply immediately"
+  if ! airvpn_ensure_runtime_zone "${UUID}" "${AIRVPN_UNDERLAY_ZONE}"; then
+    airvpn_die "Protected '${NAME}' in profile metadata, but runtime underlay zone could not be applied. Re-activate the connection manually, then re-run: airvpn-protect-connection ${UUID}"
+  fi
+  airvpn_log "INFO" "Protected '${NAME}' (${UUID}) -> zone ${AIRVPN_UNDERLAY_ZONE} (profile and runtime)"
 }
 
 airvpn_with_lock protect protect_main

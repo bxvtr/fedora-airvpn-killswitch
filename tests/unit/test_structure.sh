@@ -145,6 +145,38 @@ else
   fail "firewall-sync missing rule validation"
 fi
 
+uninstall="${ROOT}/playbooks/uninstall.yml"
+if grep -A25 'Remove project firewalld policies if present' "${uninstall}" | grep -q 'INVALID_POLICY' &&
+  grep -A25 'Remove project firewalld policies if present' "${uninstall}" | grep -q 'NOT_ENABLED'; then
+  pass "uninstall treats NOT_ENABLED/INVALID_POLICY policy absence as non-fatal"
+else
+  fail "uninstall policy deletion failed_when must accept NOT_ENABLED and INVALID_POLICY"
+fi
+
+nm_yml="${ROOT}/roles/airvpn_client/tasks/networkmanager.yml"
+if grep -q 'airvpn_ensure_runtime_zone' "${nm_yml}" &&
+  grep -q 'Reapply underlay zone on active physical interfaces' "${nm_yml}"; then
+  pass "networkmanager reapplies runtime underlay zone after profile modify"
+else
+  fail "networkmanager.yml missing runtime zone reapply"
+fi
+
+check_script="${ROOT}/roles/airvpn_client/files/airvpn-check"
+if grep -q 'ipv6.dns-priority' "${check_script}" &&
+  grep -q 'ipv6.dns-search' "${check_script}" &&
+  grep -q 'get-zone-of-interface' "${check_script}" &&
+  grep -q 'airvpn_eval_endpoint_rule_coverage' "${check_script}"; then
+  pass "airvpn-check verifies ipv6 DNS, runtime zones, exact endpoint rules"
+else
+  fail "airvpn-check missing ipv6/runtime/exact-endpoint assertions"
+fi
+
+if grep -q 'airvpn_ensure_runtime_zone' "${ROOT}/roles/airvpn_client/files/airvpn-protect-connection"; then
+  pass "airvpn-protect-connection applies runtime underlay zone"
+else
+  fail "airvpn-protect-connection missing runtime zone apply"
+fi
+
 echo
 if ((FAILS > 0)); then
   echo "STRUCTURE TESTS FAILED: ${FAILS}"

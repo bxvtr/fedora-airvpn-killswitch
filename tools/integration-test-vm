@@ -49,6 +49,7 @@ BASELINE_IPV6=""
 FIRST_VPN_IPV4=""
 SECOND_VPN_IPV4=""
 ANSIBLE_BIN=""
+ANSIBLE_PYTHON_INTERPRETER="/usr/bin/python3"
 STATE_UNCERTAIN=0
 KILL_SWITCH_MAY_BE_ACTIVE=0
 
@@ -308,10 +309,54 @@ resolve_ansible() {
   fi
 }
 
+# Match bootstrap.sh: force system Python so firewalld bindings resolve on the host.
+ansible_common_args() {
+  printf '%s\0' \
+    -i "${ROOT}/inventory/localhost.yml" \
+    -e "ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}"
+}
+
+run_ansible_capture() {
+  # run_ansible_capture logfile playbook.yml [extra ansible args...]
+  local logfile="$1"
+  local playbook="$2"
+  shift 2
+  local -a args=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    args+=("${arg}")
+  done < <(ansible_common_args)
+  args+=("${playbook}" "$@")
+  run_capture "${logfile}" "${ANSIBLE_BIN}" "${args[@]}"
+}
+
+reload_runtime_config() {
+  # Prefer installed runtime conf after install; falls back to sourced defaults.
+  if [[ -r "${AIRVPN_CONFIG_DIR}/airvpn-client.conf" ]]; then
+    airvpn_load_config
+  fi
+}
+
+nmcli_connection_terse() {
+  sudo nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show 2>/dev/null || true
+}
+
+count_active_managed() {
+  reload_runtime_config
+  it_count_active_managed_from_terse "${AIRVPN_CONNECTION_PREFIX}" "$(nmcli_connection_terse)"
+}
+
 managed_profile_names() {
-  sudo nmcli -t -f NAME connection show 2>/dev/null | while IFS= read -r n; do
-    [[ "${n}" == "AirVPN - "* ]] && printf '%s\n' "${n}"
-  done
+  reload_runtime_config
+  it_managed_names_from_terse "${AIRVPN_CONNECTION_PREFIX}" "$(nmcli_connection_terse)"
+}
+
+sudo_firewall_cmd() {
+  if sudo -n true >/dev/null 2>&1; then
+    sudo -n firewall-cmd "$@"
+  else
+    sudo firewall-cmd "$@"
+  fi
 }
 
 phase_mark() {
@@ -505,9 +550,14 @@ phase_ansible_syntax() {
   local phase="ansible-syntax"
   local ok=1
   local pb
+  local -a common=()
+  local arg
+  while IFS= read -r -d '' arg; do
+    common+=("${arg}")
+  done < <(ansible_common_args)
   for pb in install.yml verify.yml uninstall.yml; do
     if ! run_capture "ansible-syntax-${pb}.log" "${ANSIBLE_BIN}" --syntax-check \
-      -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/${pb}" \
+      "${common[@]}" "${ROOT}/playbooks/${pb}" \
       -e "airvpn_config_source=${CONFIG_SOURCE}" \
       -e "airvpn_uninstall_confirmed=true"; then
       ok=0
@@ -529,7 +579,7 @@ phase_ansible_syntax() {
   set +e
   local out rc
   out="$("${ANSIBLE_BIN}" --check --diff \
-    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+    "${common[@]}" "${ROOT}/playbooks/install.yml" \
     -e "airvpn_config_source=${CONFIG_SOURCE}" 2>&1)"
   rc=$?
   set -e
@@ -549,9 +599,9 @@ phase_baseline() {
     echo "=== ip -br link ==="
     ip -br link || true
     echo "=== firewall-cmd --get-active-zones ==="
-    firewall-cmd --get-active-zones 2>/dev/null || true
+    sudo_firewall_cmd --get-active-zones 2>/dev/null || true
     echo "=== firewall-cmd --get-policies ==="
-    firewall-cmd --get-policies 2>/dev/null || true
+    sudo_firewall_cmd --get-policies 2>/dev/null || true
     echo "=== ip -4 route ==="
     ip -4 route || true
     echo "=== ip -6 route ==="
@@ -571,37 +621,38 @@ phase_baseline() {
 phase_install() {
   local phase="install"
   KILL_SWITCH_MAY_BE_ACTIVE=1
-  if ! run_capture "install.log" "${ANSIBLE_BIN}" \
-    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+  if ! run_ansible_capture "install.log" "${ROOT}/playbooks/install.yml" \
     -e "airvpn_config_source=${CONFIG_SOURCE}"; then
     phase_mark FAIL "${phase}" "playbook failed"
     on_failure_guidance
     return 1
   fi
 
+  reload_runtime_config
+
   local fails=0
   systemctl is-active --quiet firewalld || fails=$((fails + 1))
   systemctl is-active --quiet NetworkManager || fails=$((fails + 1))
-  firewall-cmd --permanent --info-zone=airvpn >/dev/null 2>&1 || fails=$((fails + 1))
-  firewall-cmd --permanent --info-zone=vpn-underlay >/dev/null 2>&1 || fails=$((fails + 1))
-  firewall-cmd --permanent --info-policy airvpn-host-to-vpn >/dev/null 2>&1 || fails=$((fails + 1))
-  firewall-cmd --permanent --info-policy airvpn-host-to-underlay >/dev/null 2>&1 || fails=$((fails + 1))
+  sudo_firewall_cmd --permanent --info-zone="${AIRVPN_ZONE}" >/dev/null 2>&1 || fails=$((fails + 1))
+  sudo_firewall_cmd --permanent --info-zone="${AIRVPN_UNDERLAY_ZONE}" >/dev/null 2>&1 || fails=$((fails + 1))
+  sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_VPN}" >/dev/null 2>&1 || fails=$((fails + 1))
+  sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" >/dev/null 2>&1 || fails=$((fails + 1))
 
   {
     echo "=== zones ==="
-    firewall-cmd --permanent --info-zone=airvpn || true
-    firewall-cmd --permanent --info-zone=vpn-underlay || true
+    sudo_firewall_cmd --permanent --info-zone="${AIRVPN_ZONE}" || true
+    sudo_firewall_cmd --permanent --info-zone="${AIRVPN_UNDERLAY_ZONE}" || true
     echo "=== policies ==="
-    firewall-cmd --permanent --info-policy airvpn-host-to-vpn || true
-    firewall-cmd --permanent --info-policy airvpn-host-to-underlay || true
+    sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_VPN}" || true
+    sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" || true
   } >"${ARTIFACT_DIR}/installed-firewall.raw" 2>&1 || true
   it_redact_text "$(cat "${ARTIFACT_DIR}/installed-firewall.raw")" >"${ARTIFACT_DIR}/installed-firewall.txt"
   rm -f "${ARTIFACT_DIR}/installed-firewall.raw"
 
-  nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show >"${ARTIFACT_DIR}/installed-networkmanager.txt" 2>&1 || true
+  nmcli_connection_terse >"${ARTIFACT_DIR}/installed-networkmanager.txt" 2>&1 || true
 
   local active_vpn
-  active_vpn="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{print}' | wc -l)"
+  active_vpn="$(count_active_managed)"
   [[ "${active_vpn}" == "0" ]] || fails=$((fails + 1))
 
   command -v airvpn-check >/dev/null || fails=$((fails + 1))
@@ -664,15 +715,21 @@ phase_offline() {
 phase_first_vpn() {
   local phase="first-vpn"
   local names selected first second
+  local require_second=0
+  ((SKIP_SWITCH == 0)) && require_second=1
   names="$(managed_profile_names)"
-  selected="$(it_select_profiles "${names}" "${FIRST_PROFILE}" "${SECOND_PROFILE}")" || {
-    phase_mark FAIL "${phase}" "could not select managed profiles"
+  selected="$(it_select_profiles "${names}" "${FIRST_PROFILE}" "${SECOND_PROFILE}" "${require_second}")" || {
+    if ((require_second)); then
+      phase_mark FAIL "${phase}" "need two distinct managed profiles for switch testing"
+    else
+      phase_mark FAIL "${phase}" "could not select managed profiles"
+    fi
     return 1
   }
   IFS='|' read -r first second <<<"${selected}"
   FIRST_PROFILE="${first}"
   SECOND_PROFILE="${second}"
-  write_artifact "first-vpn.log" "selected_first=${first}"$'\n'"selected_second=${second:-none}"$'\n'
+  write_artifact "first-vpn.log" "selected_first=${first}"$'\n'"selected_second=${second:-none}"$'\n'"prefix=${AIRVPN_CONNECTION_PREFIX}"$'\n'
 
   if ! sudo_capture "first-vpn-activate.log" airvpn-switch --name "${first}"; then
     phase_mark FAIL "${phase}" "airvpn-switch --name failed"
@@ -707,6 +764,7 @@ phase_first_vpn() {
 
 phase_diagnostics() {
   local phase="diagnostics"
+  reload_runtime_config
   {
     echo "=== airvpn-status ==="
     sudo airvpn-status 2>&1 || true
@@ -715,11 +773,11 @@ phase_diagnostics() {
     echo "=== nmcli connection show --active ==="
     nmcli connection show --active 2>&1 || true
     echo "=== firewall-cmd --get-active-zones ==="
-    firewall-cmd --get-active-zones 2>&1 || true
-    echo "=== firewall-cmd --info-policy airvpn-host-to-vpn ==="
-    firewall-cmd --info-policy airvpn-host-to-vpn 2>&1 || true
-    echo "=== firewall-cmd --info-policy airvpn-host-to-underlay ==="
-    firewall-cmd --info-policy airvpn-host-to-underlay 2>&1 || true
+    sudo_firewall_cmd --get-active-zones 2>&1 || true
+    echo "=== firewall-cmd --info-policy ${AIRVPN_POLICY_TO_VPN} ==="
+    sudo_firewall_cmd --info-policy "${AIRVPN_POLICY_TO_VPN}" 2>&1 || true
+    echo "=== firewall-cmd --info-policy ${AIRVPN_POLICY_TO_UNDERLAY} ==="
+    sudo_firewall_cmd --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" 2>&1 || true
     echo "=== resolvectl status ==="
     resolvectl status 2>&1 || true
     echo "=== ip -4 route ==="
@@ -738,19 +796,23 @@ phase_switch() {
     phase_mark SKIP "${phase}" "requested or single config"
     return 0
   fi
-  [[ -n "${SECOND_PROFILE}" ]] || {
-    phase_mark SKIP "${phase}" "no second profile"
-    return 0
-  }
+  if [[ -z "${SECOND_PROFILE}" || "${SECOND_PROFILE}" == "${FIRST_PROFILE}" ]]; then
+    phase_mark FAIL "${phase}" "switch testing enabled but second managed profile is missing"
+    on_failure_guidance
+    return 1
+  fi
 
   local pidfile="${ARTIFACT_DIR}/switch-probe.pids"
-  : >"${pidfile}"
+  local run_marker="${ARTIFACT_DIR}/switch-probe.run"
   local probe_log="${ARTIFACT_DIR}/switch-probes.log"
+  : >"${pidfile}"
   : >"${probe_log}"
+  touch "${run_marker}"
 
   (
-    local i observed class
-    for i in $(seq 1 40); do
+    local observed class
+    # Continue for the whole switch (and optional switch-back), not a fixed wall clock.
+    while [[ -f "${run_marker}" ]]; do
       observed="$(lookup_public_ip 4 || echo fail)"
       class="$(it_classify_switch_observation "${observed}" "${BASELINE_IPV4}" "${FIRST_VPN_IPV4}" "${SECOND_VPN_IPV4}")"
       printf '%s observed=%s class=%s\n' "$(date -Is)" "${observed}" "${class}" >>"${probe_log}"
@@ -759,12 +821,23 @@ phase_switch() {
       fi
       sleep 1
     done
+    # Short post-stop grace samples while switch-back settles.
+    local i
+    for i in 1 2 3; do
+      observed="$(lookup_public_ip 4 || echo fail)"
+      class="$(it_classify_switch_observation "${observed}" "${BASELINE_IPV4}" "${FIRST_VPN_IPV4}" "${SECOND_VPN_IPV4}")"
+      printf '%s observed=%s class=%s post\n' "$(date -Is)" "${observed}" "${class}" >>"${probe_log}"
+      if [[ "${class}" == "baseline_leak" ]]; then
+        printf 'LEAK\n' >>"${probe_log}"
+      fi
+      sleep 1
+    done
   ) &
   echo $! >>"${pidfile}"
-  trap 'it_cleanup_pidfile "'"${pidfile}"'"' EXIT
+  trap 'rm -f "'"${run_marker}"'"; it_cleanup_pidfile "'"${pidfile}"'"' EXIT
 
   if ! sudo_capture "switch-activate.log" airvpn-switch --name "${SECOND_PROFILE}"; then
-    it_cleanup_pidfile "${pidfile}"
+    it_stop_probe_loop "${run_marker}" "${pidfile}"
     trap - EXIT
     phase_mark FAIL "${phase}" "switch to second profile failed"
     on_failure_guidance
@@ -774,10 +847,10 @@ phase_switch() {
   SECOND_VPN_IPV4="$(lookup_public_ip 4 || true)"
   append_artifact "switch-probes.log" "second_vpn_ipv4=${SECOND_VPN_IPV4:-unavailable}"$'\n'
 
-  # Optional switch back once
+  # Optional switch back once while probes are still running.
   sudo airvpn-switch --name "${FIRST_PROFILE}" >/dev/null 2>&1 || true
   sleep 2
-  it_cleanup_pidfile "${pidfile}"
+  it_stop_probe_loop "${run_marker}" "${pidfile}"
   trap - EXIT
 
   if grep -q '^LEAK$' "${probe_log}" 2>/dev/null; then
@@ -786,7 +859,7 @@ phase_switch() {
     return 1
   fi
   local multi
-  multi="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{c++} END{print c+0}')"
+  multi="$(count_active_managed)"
   if [[ "${multi}" -gt 1 ]]; then
     phase_mark FAIL "${phase}" "multiple managed VPNs active (${multi})"
     on_failure_guidance
@@ -846,7 +919,7 @@ Resume it, wait until the guest is usable, then press Enter.
 EOF
   read -r -p "Press Enter after resume: " _
   local active
-  active="$(sudo nmcli -t -f NAME,STATE connection show 2>/dev/null | awk -F: '/^AirVPN - / && $2=="activated"{c++} END{print c+0}')"
+  active="$(count_active_managed)"
   if [[ "${active}" -gt 1 ]]; then
     phase_mark FAIL "${phase}" "more than one managed VPN active"
     return 1
@@ -866,8 +939,7 @@ EOF
 
 phase_idempotency() {
   local phase="idempotency"
-  if ! run_capture "idempotency.log" "${ANSIBLE_BIN}" \
-    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/install.yml" \
+  if ! run_ansible_capture "idempotency.log" "${ROOT}/playbooks/install.yml" \
     -e "airvpn_config_source=${CONFIG_SOURCE}"; then
     phase_mark FAIL "${phase}" "second install failed"
     on_failure_guidance
@@ -893,8 +965,8 @@ phase_uninstall() {
     KILL_SWITCH_MAY_BE_ACTIVE=1
     return 0
   fi
-  if ! run_capture "uninstall.log" "${ANSIBLE_BIN}" \
-    -i "${ROOT}/inventory/localhost.yml" "${ROOT}/playbooks/uninstall.yml" \
+  reload_runtime_config
+  if ! run_ansible_capture "uninstall.log" "${ROOT}/playbooks/uninstall.yml" \
     -e "airvpn_uninstall_confirmed=true"; then
     phase_mark FAIL "${phase}" "uninstall playbook failed"
     on_failure_guidance
@@ -902,17 +974,33 @@ phase_uninstall() {
   fi
 
   local fails=0
-  firewall-cmd --permanent --info-policy airvpn-host-to-vpn >/dev/null 2>&1 && fails=$((fails + 1))
-  firewall-cmd --permanent --info-policy airvpn-host-to-underlay >/dev/null 2>&1 && fails=$((fails + 1))
+  # Policies should be gone. Distinguish present vs absent vs sudo/tool errors.
+  local fw_out fw_rc class
+  set +e
+  fw_out="$(sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_VPN}" 2>&1)"
+  fw_rc=$?
+  set -e
+  class="$(it_classify_firewall_info_absence "${fw_rc}" "${fw_out}")"
+  case "${class}" in
+    present | error) fails=$((fails + 1)) ;;
+  esac
+  set +e
+  fw_out="$(sudo_firewall_cmd --permanent --info-policy "${AIRVPN_POLICY_TO_UNDERLAY}" 2>&1)"
+  fw_rc=$?
+  set -e
+  class="$(it_classify_firewall_info_absence "${fw_rc}" "${fw_out}")"
+  case "${class}" in
+    present | error) fails=$((fails + 1)) ;;
+  esac
   command -v airvpn-check >/dev/null 2>&1 && fails=$((fails + 1))
   systemctl is-active --quiet NetworkManager || fails=$((fails + 1))
   systemctl is-active --quiet firewalld || fails=$((fails + 1))
 
   {
     echo "=== post uninstall nmcli ==="
-    nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show || true
+    nmcli_connection_terse || true
     echo "=== post uninstall zones ==="
-    firewall-cmd --get-zones || true
+    sudo_firewall_cmd --get-zones || true
     echo "=== ip -4 route ==="
     ip -4 route || true
   } >"${ARTIFACT_DIR}/post-uninstall-network.raw" 2>&1 || true

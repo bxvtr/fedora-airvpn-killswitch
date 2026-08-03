@@ -116,31 +116,56 @@ check_endpoint_exceptions() {
     fail "managed config dir missing"
     return
   fi
+
+  local expected_keys=""
+  local rc=0
+  set +e
+  expected_keys="$(airvpn_collect_endpoints_from_dir "${AIRVPN_MANAGED_CONFIG_DIR}" 2>/dev/null)"
+  rc=$?
+  set -e
+  if ((rc != 0)); then
+    fail "failed to collect endpoints from managed configs"
+    return
+  fi
+
   local count=0
   local _line
   while IFS= read -r _line; do
     [[ -n "${_line}" ]] || continue
     count=$((count + 1))
-  done < <(airvpn_collect_endpoints_from_dir "${AIRVPN_MANAGED_CONFIG_DIR}" 2>/dev/null || true)
+  done <<<"${expected_keys}"
 
   if ((count == 0)); then
     warn "no endpoints discovered in managed configs"
-  else
-    pass "discovered ${count} endpoint exception candidate(s)"
+    return
   fi
+  pass "discovered ${count} endpoint exception candidate(s)"
 
   local rules
   rules="$(firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --list-rich-rules 2>/dev/null || true)"
-  if grep -q 'protocol="udp"' <<<"${rules}"; then
-    pass "underlay policy has UDP endpoint rich rules"
+
+  local coverage summary
+  set +e
+  coverage="$(airvpn_eval_endpoint_rule_coverage "${expected_keys}" "${rules}")"
+  rc=$?
+  set -e
+  summary="$(printf '%s\n' "${coverage}" | grep -E '^missing=' | tail -n1 || true)"
+  if ((rc == 0)); then
+    pass "endpoint exceptions match managed configs (${summary})"
   else
-    fail "underlay policy has no UDP endpoint rich rules"
+    fail "endpoint exceptions do not match managed configs (${summary})"
+    while IFS= read -r _line; do
+      [[ "${_line}" == MISSING* || "${_line}" == STALE* ]] || continue
+      # Rule text contains only numeric destinations/ports — never private keys.
+      fail "  ${_line}"
+    done <<<"${coverage}"
   fi
 }
 
 check_profiles() {
   local found=0
   local uuid name _ctype _device state zone auto prio search
+  local prio6 search6 method6
   while IFS='|' read -r uuid name _ctype _device state; do
     found=$((found + 1))
     auto="$(nmcli -g connection.autoconnect connection show "${uuid}")"
@@ -158,14 +183,36 @@ check_profiles() {
       fail "profile ${name}: zone is '${zone}', expected ${AIRVPN_ZONE}"
     fi
     if [[ "${prio}" == "${AIRVPN_DNS_PRIORITY}" ]]; then
-      pass "profile ${name}: dns-priority ${prio}"
+      pass "profile ${name}: ipv4 dns-priority ${prio}"
     else
-      fail "profile ${name}: dns-priority '${prio}', expected ${AIRVPN_DNS_PRIORITY}"
+      fail "profile ${name}: ipv4 dns-priority '${prio}', expected ${AIRVPN_DNS_PRIORITY}"
     fi
     if [[ "${search}" == *'~.'* ]]; then
-      pass "profile ${name}: routing domain ~. present"
+      pass "profile ${name}: ipv4 routing domain ~. present"
     else
-      fail "profile ${name}: missing dns-search ~."
+      fail "profile ${name}: missing ipv4 dns-search ~."
+    fi
+
+    if airvpn_is_truthy "${AIRVPN_ENABLE_IPV6}"; then
+      prio6="$(nmcli -g ipv6.dns-priority connection show "${uuid}")"
+      search6="$(nmcli -g ipv6.dns-search connection show "${uuid}")"
+      if [[ "${prio6}" == "${AIRVPN_DNS_PRIORITY}" ]]; then
+        pass "profile ${name}: ipv6 dns-priority ${prio6}"
+      else
+        fail "profile ${name}: ipv6 dns-priority '${prio6}', expected ${AIRVPN_DNS_PRIORITY}"
+      fi
+      if [[ "${search6}" == *'~.'* ]]; then
+        pass "profile ${name}: ipv6 routing domain ~. present"
+      else
+        fail "profile ${name}: missing ipv6 dns-search ~."
+      fi
+    else
+      method6="$(nmcli -g ipv6.method connection show "${uuid}")"
+      if [[ "${method6}" == "disabled" ]]; then
+        pass "profile ${name}: ipv6 method disabled"
+      else
+        fail "profile ${name}: ipv6.method is '${method6}', expected disabled when IPv6 is off"
+      fi
     fi
   done < <(airvpn_list_managed_connections)
 
@@ -175,7 +222,7 @@ check_profiles() {
 }
 
 check_unsafe_physical() {
-  local line uuid name ctype state zone
+  local line uuid name ctype state zone_profile devices device zone_runtime
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     airvpn_nmcli_split_terse "${line}"
@@ -186,12 +233,28 @@ check_unsafe_physical() {
     state="${AIRVPN_NM_FIELDS[4]}"
     [[ "${ctype}" == "802-11-wireless" || "${ctype}" == "802-3-ethernet" ]] || continue
     [[ "${state}" == "activated" ]] || continue
-    zone="$(nmcli -g connection.zone connection show "${uuid}")"
-    if [[ "${zone}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
-      fail "active physical connection '${name}' not in underlay zone (zone=${zone:-unset})"
+    zone_profile="$(nmcli -g connection.zone connection show "${uuid}")"
+    if [[ "${zone_profile}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
+      fail "active physical '${name}' profile zone is '${zone_profile:-unset}', expected ${AIRVPN_UNDERLAY_ZONE}"
     else
-      pass "active physical '${name}' in underlay zone"
+      pass "active physical '${name}' profile zone ${zone_profile}"
     fi
+
+    devices="$(nmcli -g GENERAL.DEVICES connection show "${uuid}" 2>/dev/null || true)"
+    devices="${devices//,/ }"
+    if [[ -z "${devices}" || "${devices}" == "--" ]]; then
+      fail "active physical '${name}' has no device; cannot verify runtime firewalld zone"
+      continue
+    fi
+    for device in ${devices}; do
+      [[ -n "${device}" && "${device}" != "--" && "${device}" != "lo" ]] || continue
+      zone_runtime="$(firewall-cmd --get-zone-of-interface="${device}" 2>/dev/null || true)"
+      if [[ "${zone_runtime}" != "${AIRVPN_UNDERLAY_ZONE}" ]]; then
+        fail "active physical '${name}' runtime zone on ${device} is '${zone_runtime:-unset}', expected ${AIRVPN_UNDERLAY_ZONE}"
+      else
+        pass "active physical '${name}' runtime zone on ${device} is ${zone_runtime}"
+      fi
+    done
   done < <(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show)
 }
 

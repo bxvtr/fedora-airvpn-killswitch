@@ -19,7 +19,13 @@
 
 - name: Query current zone for each physical connection
   ansible.builtin.command:
-    cmd: nmcli -g connection.zone connection show {{ item }}
+    argv:
+      - nmcli
+      - -g
+      - connection.zone
+      - connection
+      - show
+      - "{{ item }}"
   register: airvpn_physical_zones
   changed_when: false
   loop: "{{ airvpn_physical_uuids }}"
@@ -29,7 +35,14 @@
 
 - name: Assign physical NetworkManager profiles to underlay zone
   ansible.builtin.command:
-    cmd: nmcli connection modify uuid {{ item.item }} connection.zone {{ airvpn_underlay_zone }}
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - uuid
+      - "{{ item.item }}"
+      - connection.zone
+      - "{{ airvpn_underlay_zone }}"
   loop: "{{ airvpn_physical_zones.results | default([]) }}"
   loop_control:
     label: "{{ item.item }}"
@@ -37,6 +50,26 @@
     - airvpn_physical_uuids | length > 0
     - (item.stdout | default('') | trim) != airvpn_underlay_zone
   changed_when: true
+
+# nmcli connection.zone updates profile metadata only. Active interfaces may keep
+# a previous firewalld runtime zone until reapply. Always verify runtime binding
+# for managed physical UUIDs and fail closed if an active interface cannot bind.
+- name: Reapply underlay zone on active physical interfaces
+  ansible.builtin.shell: |
+    set -Eeuo pipefail
+    # shellcheck disable=SC1091
+    source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+    airvpn_ensure_runtime_zone "{{ item }}" "{{ airvpn_underlay_zone }}"
+  args:
+    executable: /bin/bash
+  loop: "{{ airvpn_physical_uuids }}"
+  loop_control:
+    label: "{{ item }}"
+  when: airvpn_physical_uuids | length > 0
+  register: airvpn_runtime_zone
+  changed_when: >-
+    'applied ' in (airvpn_runtime_zone.stdout | default(''))
+  failed_when: airvpn_runtime_zone.rc != 0
 
 - name: Import AirVPN WireGuard profiles via airvpn-import
   ansible.builtin.command:

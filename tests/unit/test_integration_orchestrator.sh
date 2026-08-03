@@ -80,6 +80,51 @@ else
   pass "reject missing first hint"
 fi
 
+# Single managed profile is OK when second is optional
+sel="$(it_select_profiles $'AirVPN - One\n' '' '')"
+[[ "${sel}" == "AirVPN - One|" ]] && pass "single profile without require_second" || fail "single optional=${sel}"
+
+if it_select_profiles $'AirVPN - One\n' '' '' 1; then
+  fail "require_second should fail with one profile"
+else
+  pass "require_second rejects single profile"
+fi
+
+if it_select_profiles $'Custom - A\nCustom - B\n' '' '' 1 >/dev/null; then
+  sel="$(it_select_profiles $'Custom - A\nCustom - B\n' '' '' 1)"
+  [[ "${sel}" == "Custom - A|Custom - B" ]] && pass "require_second with two profiles" || fail "require_second two=${sel}"
+else
+  fail "require_second should succeed with two profiles"
+fi
+
+# --- escape-aware active managed counting ---
+terse=$'uuid-1:AirVPN - Plain:wireguard::activated\nuuid-2:AirVPN - Name\\:with\\:colons:wireguard:avpn0:activated\nuuid-3:Other VPN:wireguard::activated\nuuid-4:AirVPN - Idle:wireguard::'
+[[ "$(it_count_active_managed_from_terse 'AirVPN - ' "${terse}")" == "2" ]] &&
+  pass "count active with escaped colons" ||
+  fail "active count=$(it_count_active_managed_from_terse 'AirVPN - ' "${terse}")"
+
+names="$(it_managed_names_from_terse 'Custom - ' $'u1:Custom - One:wireguard::\nu2:AirVPN - X:wireguard::\nu3:Custom - Two:wireguard::')"
+[[ "${names}" == $'Custom - One\nCustom - Two' ]] && pass "managed names honor custom prefix" || fail "names=${names}"
+
+# firewall info absence classification (uninstall assertions)
+[[ "$(it_classify_firewall_info_absence 0 'zone airvpn')" == "present" ]] && pass "firewall present" || fail "present"
+[[ "$(it_classify_firewall_info_absence 1 'Error: INVALID_POLICY: ...')" == "absent" ]] && pass "firewall absent INVALID_POLICY" || fail "absent policy"
+[[ "$(it_classify_firewall_info_absence 1 'sudo: a password is required')" == "error" ]] && pass "firewall sudo error not absent" || fail "sudo error"
+[[ "$(it_classify_firewall_info_absence 127 'command not found')" == "error" ]] && pass "firewall unknown error not absent" || fail "unknown error"
+
+# Marker-driven probe stop
+marker="$(mktemp)"
+pidfile="$(mktemp)"
+touch "${marker}"
+(
+  while [[ -f "${marker}" ]]; do
+    sleep 0.2
+  done
+) &
+echo $! >"${pidfile}"
+it_stop_probe_loop "${marker}" "${pidfile}" 5
+[[ ! -f "${marker}" && ! -f "${pidfile}" ]] && pass "probe loop stop cleans marker/pids" || fail "probe stop cleanup"
+
 # --- baseline IP comparison ---
 rc=0
 it_public_ip_differs_from_baseline "203.0.113.10" "198.51.100.1" || rc=$?
@@ -189,6 +234,31 @@ if grep -q -- '--skip-uninstall' "${ROOT}/tools/integration-test-vm"; then
   pass "skip-uninstall option present"
 else
   fail "skip-uninstall missing"
+fi
+
+# Live ansible invocations must force system Python (like bootstrap.sh)
+if grep -q 'ANSIBLE_PYTHON_INTERPRETER="/usr/bin/python3"' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'ansible_python_interpreter=${ANSIBLE_PYTHON_INTERPRETER}' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'run_ansible_capture' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'sudo_firewall_cmd' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'it_count_active_managed_from_terse' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'AIRVPN_CONNECTION_PREFIX' "${ROOT}/tools/integration-test-vm" &&
+  grep -q 'switch-probe.run' "${ROOT}/tools/integration-test-vm" &&
+  ! grep -E -q 'awk -F:.*AirVPN' "${ROOT}/tools/integration-test-vm"; then
+  pass "integration runner uses sudo firewall, prefix, escape-aware counts, marker probes, system python"
+else
+  fail "integration runner missing required bugfix patterns"
+fi
+
+# Empty second profile must FAIL (not SKIP) when switch testing is enabled
+if grep -A5 'phase_switch()' "${ROOT}/tools/integration-test-vm" | grep -q 'SKIP_SWITCH'; then
+  if grep -n 'no second profile' "${ROOT}/tools/integration-test-vm" | grep -q SKIP; then
+    fail "phase_switch still SKIPs missing second profile"
+  else
+    pass "phase_switch fails closed without second profile"
+  fi
+else
+  fail "phase_switch structure unexpected"
 fi
 
 echo

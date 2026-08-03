@@ -131,3 +131,30 @@ it_cleanup_pidfile() {
   done <"${pidfile}"
   rm -f "${pidfile}"
 }
+
+# Stop a marker-driven probe loop, then wait briefly for the worker to exit.
+# Args: run_marker_file pidfile [grace_seconds]
+it_stop_probe_loop() {
+  local marker="${1:-}"
+  local pidfile="${2:-}"
+  local grace="${3:-3}"
+  [[ -n "${marker}" ]] && rm -f "${marker}"
+  local i
+  for ((i = 0; i < grace; i++)); do
+    if [[ -n "${pidfile}" && -f "${pidfile}" ]]; then
+      local alive=0 pid
+      while IFS= read -r pid; do
+        [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+        if kill -0 "${pid}" 2>/dev/null; then
+          alive=1
+          break
+        fi
+      done <"${pidfile}"
+      ((alive == 0)) && break
+    else
+      break
+    fi
+    sleep 1
+  done
+  it_cleanup_pidfile "${pidfile}"
+}
