@@ -542,7 +542,11 @@ EOF
 chmod +x "${MOCKBIN}/nmcli"
 OUT_SIG="${TMP}/audit-sig"
 mkdir -p "${OUT_SIG}"
-setsid bash "${SCRIPT}" --run-name runSigTerm --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
+sig_err_term="${TMP}/sig-term.err"
+# Do not use setsid here: background job PID must be the collector bash so
+# wait(1) observes the trap exit status (130/143), not a short-lived setsid.
+bash "${SCRIPT}" --run-name runSigTerm --phase baseline --output-root "${OUT_SIG}" \
+  >/dev/null 2>"${sig_err_term}" &
 sig_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
   sp_wait="$(find "${OUT_SIG}/runSigTerm" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
@@ -551,7 +555,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
   fi
   sleep 0.1
 done
-kill -TERM -- "-${sig_pid}" 2>/dev/null || kill -TERM "${sig_pid}" 2>/dev/null || true
+kill -TERM "${sig_pid}" 2>/dev/null || true
 set +e
 wait "${sig_pid}"
 sig_rc=$?
@@ -564,13 +568,13 @@ if [[ "${sig_rc}" -eq 143 && ! -d "${OUT_SIG}/runSigTerm/baseline" ]]; then
     fail "SIGTERM missing FAILED.txt after successful marker path (rc=${sig_rc})"
   fi
 else
-  fail "SIGTERM publish/exit semantics broken (rc=${sig_rc})"
+  fail "SIGTERM publish/exit semantics broken (rc=${sig_rc}; stderr=$(tr '\n' ' ' <"${sig_err_term}" | head -c 200))"
 fi
 
 # Marker write failure must warn on stderr, keep signal exit code, never publish
 export UAS_TEST_FAIL_MARKER_WRITE=1
 sig_err="${TMP}/sig-marker.err"
-setsid bash "${SCRIPT}" --run-name runSigMark --phase baseline --output-root "${OUT_SIG}" \
+bash "${SCRIPT}" --run-name runSigMark --phase baseline --output-root "${OUT_SIG}" \
   >/dev/null 2>"${sig_err}" &
 sig_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
@@ -580,7 +584,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
   fi
   sleep 0.1
 done
-kill -TERM -- "-${sig_pid}" 2>/dev/null || kill -TERM "${sig_pid}" 2>/dev/null || true
+kill -TERM "${sig_pid}" 2>/dev/null || true
 set +e
 wait "${sig_pid}"
 sig_rc=$?
@@ -596,7 +600,7 @@ if [[ "${sig_rc}" -eq 143 && ! -d "${OUT_SIG}/runSigMark/baseline" && -n "${sp_m
     fail "test hook did not prevent FAILED.txt"
   fi
 else
-  fail "marker write failure path broken (rc=${sig_rc})"
+  fail "marker write failure path broken (rc=${sig_rc}; stderr=$(tr '\n' ' ' <"${sig_err}" | head -c 200))"
 fi
 
 # Unmarked partial blocks reuse; message names the path; no auto-delete

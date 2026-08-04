@@ -888,11 +888,13 @@ directory and remove it manually before retrying the same --run-name/--phase."
 
   # Keep EXIT armed so a failed marker still gets a fallback attempt. Clear
   # INT/TERM only to avoid re-entrant signal handling.
+  local capture_abort_code=0
   uas_capture_on_signal() {
     local signal_name="$1"
     local exit_code="$2"
     trap - INT TERM
     publish_allowed=0
+    capture_abort_code="${exit_code}"
     uas_write_failure_marker "signal" "${signal_name}" || true
     # Stop children blocked in host probes so a deferred wait cannot resume
     # into the publish path after the signal handler returns.
@@ -935,6 +937,10 @@ directory and remove it manually before retrying the same --run-name/--phase."
   uas_collect_services "${partial_dir}/services.txt"
   uas_collect_packages "${partial_dir}"
   uas_collect_connectivity "${partial_dir}/connectivity.txt"
+
+  if ((capture_abort_code != 0)); then
+    exit "${capture_abort_code}"
+  fi
 
   local required_files=(
     metadata.txt
@@ -984,6 +990,11 @@ directory and remove it manually before retrying the same --run-name/--phase."
 
   if [[ -e "${partial_dir}/FAILED.txt" ]]; then
     trap - INT TERM
+    # If a signal already requested abort but control somehow resumed, keep the
+    # original signal status instead of converting it into a generic die(2).
+    if ((capture_abort_code != 0)); then
+      exit "${capture_abort_code}"
+    fi
     die "Capture marked failed; refusing to publish (partial left at ${partial_dir})"
   fi
 
