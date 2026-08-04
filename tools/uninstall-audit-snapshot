@@ -819,6 +819,9 @@ Inspect or remove it manually after review."
     trap - INT TERM EXIT
     publish_allowed=0
     uas_write_failure_marker "signal" "${signal_name}"
+    # Stop children blocked in host probes so a deferred wait cannot resume
+    # into the publish path after the signal handler returns.
+    pkill -P "$$" >/dev/null 2>&1 || true
     exit "${exit_code}"
   }
 

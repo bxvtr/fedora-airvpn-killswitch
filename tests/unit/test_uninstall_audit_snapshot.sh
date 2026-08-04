@@ -447,7 +447,8 @@ else
 fi
 
 # Structural: capture must not wrap the collector list in broad set +e
-if grep -B6 'uas_write_phase_metadata "${partial_dir}/metadata.txt"' "${SCRIPT}" | grep -q 'set +e'; then
+if grep -B6 'uas_write_phase_metadata "${partial_dir}/metadata.txt"' "${SCRIPT}" |
+  grep -E -q '^[[:space:]]*set \+e[[:space:]]*$'; then
   fail "capture still begins collectors under broad set +e"
 else
   pass "capture does not disable errexit for the collector list"
@@ -513,14 +514,15 @@ fi
 # SIGINT during hanging collector: no final phase, exit 130
 cat >"${MOCKBIN}/nmcli" <<'EOF'
 #!/usr/bin/env bash
-# Hang so the unit test can deliver SIGINT before publish.
+# Hang once so the unit test can deliver SIGINT before publish.
 sleep 60
 exit 0
 EOF
 chmod +x "${MOCKBIN}/nmcli"
 OUT_SIG="${TMP}/audit-sig"
 mkdir -p "${OUT_SIG}"
-bash "${SCRIPT}" --run-name runSigInt --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
+# Separate process group so SIGINT reaches the collector and its children.
+setsid bash "${SCRIPT}" --run-name runSigInt --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
 sig_pid=$!
 # Wait until capture has started collectors (traps installed; metadata written).
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
@@ -530,7 +532,8 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
   fi
   sleep 0.1
 done
-kill -INT "${sig_pid}" 2>/dev/null || true
+# Negative PID: signal the collector process group (setsid leader).
+kill -INT -- "-${sig_pid}" 2>/dev/null || kill -INT "${sig_pid}" 2>/dev/null || true
 set +e
 wait "${sig_pid}"
 sig_rc=$?
@@ -547,7 +550,7 @@ else
 fi
 
 # SIGTERM during hanging collector: no final phase, exit 143
-bash "${SCRIPT}" --run-name runSigTerm --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
+setsid bash "${SCRIPT}" --run-name runSigTerm --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
 sig_pid=$!
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
   sp_wait="$(find "${OUT_SIG}/runSigTerm" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
@@ -556,7 +559,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
   fi
   sleep 0.1
 done
-kill -TERM "${sig_pid}" 2>/dev/null || true
+kill -TERM -- "-${sig_pid}" 2>/dev/null || kill -TERM "${sig_pid}" 2>/dev/null || true
 set +e
 wait "${sig_pid}"
 sig_rc=$?
