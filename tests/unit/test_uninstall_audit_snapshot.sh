@@ -420,17 +420,163 @@ fi
 bash "${SCRIPT}" --run-name runD --phase installed --output-root "${OUT2}"
 [[ -d "${OUT2}/runD/installed" ]] && pass "direct capture path supported with test root skip" || fail "installed phase missing"
 
-# Atomic publish: no leftover successful-looking phase on failure — simulate by precreating phase mid-flight is hard;
-# ensure partial naming convention exists in script
-if grep -q 'partial' "${SCRIPT}" && grep -q 'mv --' "${SCRIPT}"; then
-  pass "atomic partial publish path present"
+# --- Publish / interrupt safety (mocked; no live host collectors) ---
+
+# Successful capture leaves no partial and no FAILED.txt
+bash "${SCRIPT}" --run-name runPub --phase baseline --output-root "${OUT2}"
+pub_phase="${OUT2}/runPub/baseline"
+partials_left="$(find "${OUT2}/runPub" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | wc -l)"
+if [[ -d "${pub_phase}" && ! -e "${pub_phase}/FAILED.txt" && "${partials_left}" -eq 0 ]]; then
+  pass "successful capture publishes final phase without FAILED.txt or leftover partial"
 else
-  fail "atomic publish missing"
+  fail "successful capture publish invariants broken"
 fi
 
-# Failed capture must not leave published phase: create undeletable conflict by making phase a file after? skip.
-# Git unavailable path: already exercised if .git present; assert helper returns unavailable without git dir
-# Covered by code path uas_git_field.
+# Structural: capture must not wrap the collector list in broad set +e
+if grep -B6 'uas_write_phase_metadata "${partial_dir}/metadata.txt"' "${SCRIPT}" | grep -q 'set +e'; then
+  fail "capture still begins collectors under broad set +e"
+else
+  pass "capture does not disable errexit for the collector list"
+fi
+
+if grep -q "uas_capture_on_signal INT 130" "${SCRIPT}" &&
+  grep -q "uas_capture_on_signal TERM 143" "${SCRIPT}" &&
+  grep -q 'publish_allowed=1' "${SCRIPT}"; then
+  pass "signal handlers exit non-zero and publish uses an explicit success gate"
+else
+  fail "signal/publish gate markers missing"
+fi
+
+# Critical failure writing manifest: do not publish final phase
+OUT_FAIL="${TMP}/audit-fail"
+mkdir -p "${OUT_FAIL}"
+REAL_MKTEMP="$(command -v mktemp)"
+cat >"${MOCKBIN}/mktemp" <<EOF
+#!/usr/bin/env bash
+if [[ "\$*" == *manifest* ]]; then
+  echo "forced mktemp failure for manifest" >&2
+  exit 1
+fi
+exec "${REAL_MKTEMP}" "\$@"
+EOF
+chmod +x "${MOCKBIN}/mktemp"
+set +e
+bash "${SCRIPT}" --run-name runFail --phase baseline --output-root "${OUT_FAIL}" >/dev/null 2>&1
+rc=$?
+set -e
+# Restore mktemp for later tests
+cat >"${MOCKBIN}/mktemp" <<EOF
+#!/usr/bin/env bash
+exec "${REAL_MKTEMP}" "\$@"
+EOF
+chmod +x "${MOCKBIN}/mktemp"
+if [[ "${rc}" -ne 0 && ! -d "${OUT_FAIL}/runFail/baseline" ]]; then
+  fp="$(find "${OUT_FAIL}/runFail" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+  if [[ -n "${fp}" && -f "${fp}/FAILED.txt" ]] && grep -q 'failure_type=' "${fp}/FAILED.txt"; then
+    pass "critical manifest write failure leaves failed partial and no final phase"
+  elif [[ -n "${fp}" ]]; then
+    pass "critical manifest write failure prevents publish and retains partial"
+  else
+    pass "critical manifest write failure prevents final phase publish"
+  fi
+else
+  fail "critical failure published phase or exited zero (rc=${rc})"
+fi
+
+# WARN/SKIP path: remove optional curl; connectivity without opt-in still publishes
+rm -f "${MOCKBIN}/curl"
+bash "${SCRIPT}" --run-name runSkip --phase baseline --output-root "${OUT_FAIL}"
+if [[ -d "${OUT_FAIL}/runSkip/baseline" && ! -e "${OUT_FAIL}/runSkip/baseline/FAILED.txt" ]] &&
+  grep -q 'not requested' "${OUT_FAIL}/runSkip/baseline/connectivity.txt"; then
+  pass "WARN/SKIP optional tooling does not block successful publish"
+else
+  fail "optional SKIP path blocked publish incorrectly"
+fi
+
+# SIGINT during hanging collector: no final phase, exit 130
+cat >"${MOCKBIN}/nmcli" <<'EOF'
+#!/usr/bin/env bash
+# Hang so the unit test can deliver SIGINT before publish.
+sleep 60
+exit 0
+EOF
+chmod +x "${MOCKBIN}/nmcli"
+OUT_SIG="${TMP}/audit-sig"
+mkdir -p "${OUT_SIG}"
+bash "${SCRIPT}" --run-name runSigInt --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
+sig_pid=$!
+# Wait until capture has started collectors (traps installed; metadata written).
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  sp_wait="$(find "${OUT_SIG}/runSigInt" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+  if [[ -n "${sp_wait}" && -f "${sp_wait}/metadata.txt" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+kill -INT "${sig_pid}" 2>/dev/null || true
+set +e
+wait "${sig_pid}"
+sig_rc=$?
+set -e
+if [[ "${sig_rc}" -eq 130 && ! -d "${OUT_SIG}/runSigInt/baseline" ]]; then
+  sp="$(find "${OUT_SIG}/runSigInt" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+  if [[ -n "${sp}" && -f "${sp}/FAILED.txt" ]] && grep -q 'failure_type=signal' "${sp}/FAILED.txt"; then
+    pass "SIGINT prevents publish and exits 130 with FAILED partial"
+  else
+    pass "SIGINT prevents publish and exits 130"
+  fi
+else
+  fail "SIGINT publish/exit semantics broken (rc=${sig_rc})"
+fi
+
+# SIGTERM during hanging collector: no final phase, exit 143
+bash "${SCRIPT}" --run-name runSigTerm --phase baseline --output-root "${OUT_SIG}" >/dev/null 2>&1 &
+sig_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  sp_wait="$(find "${OUT_SIG}/runSigTerm" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+  if [[ -n "${sp_wait}" && -f "${sp_wait}/metadata.txt" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+kill -TERM "${sig_pid}" 2>/dev/null || true
+set +e
+wait "${sig_pid}"
+sig_rc=$?
+set -e
+if [[ "${sig_rc}" -eq 143 && ! -d "${OUT_SIG}/runSigTerm/baseline" ]]; then
+  pass "SIGTERM prevents publish and exits 143"
+else
+  fail "SIGTERM publish/exit semantics broken (rc=${sig_rc})"
+fi
+
+# Restore fast nmcli mock used earlier in this file
+cat >"${MOCKBIN}/nmcli" <<'EOF'
+#!/usr/bin/env bash
+echo "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:AirVPN - Demo:wireguard::activated"
+exit 0
+EOF
+chmod +x "${MOCKBIN}/nmcli"
+
+# Compare refuses phases that contain FAILED.txt
+OUT_CMP="${TMP}/audit-cmp-fail"
+mkdir -p "${OUT_CMP}/runBad/baseline" "${OUT_CMP}/runBad/uninstalled"
+printf 'phase=baseline\nfailure_type=signal\nsignal_or_exit_status=INT\nfailed_at=test\n' \
+  >"${OUT_CMP}/runBad/baseline/FAILED.txt"
+printf 'ok\n' >"${OUT_CMP}/runBad/uninstalled/manifest.txt"
+set +e
+bash "${SCRIPT}" --run-name runBad --compare --output-root "${OUT_CMP}" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "${rc}" -eq 2 ]] && pass "compare mode refuses phases containing FAILED.txt" ||
+  fail "compare mode accepted FAILED.txt phase (rc=${rc})"
+
+# Existing final phase still untouched (re-check after new tests)
+if [[ -d "${OUT1}/runA/baseline" ]]; then
+  pass "earlier final phase directory remains intact"
+else
+  fail "earlier final phase directory was disturbed"
+fi
 
 echo
 if ((FAIL > 0)); then

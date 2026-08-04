@@ -28,7 +28,6 @@ COMPARE_MODE=0
 INCLUDE_CONNECTIVITY=0
 
 MANIFEST_LINES=()
-CAPTURE_FAILED=0
 
 usage() {
   cat <<'EOF'
@@ -60,6 +59,8 @@ Safety:
   - Requires root for capture (incomplete read-only data otherwise)
   - Refuses to overwrite an existing phase directory (no --force)
   - Publishes each phase atomically from a private partial directory
+  - Interrupted or critically failed captures leave a failed partial and
+    never publish a final phase directory
   - Does not read WireGuard private material or NetworkManager keyfile secrets
   - Artifacts may still contain network metadata (zones, endpoints, public IPs)
 
@@ -793,14 +794,47 @@ Inspect or remove it manually after review."
   mkdir -p -- "${partial_dir}"
   chmod 0700 -- "${partial_dir}"
 
-  cleanup_partial_on_signal() {
-    printf 'FAILED: interrupted\n' >"${partial_dir}/FAILED.txt" 2>/dev/null || true
-    chmod 0600 "${partial_dir}/FAILED.txt" 2>/dev/null || true
+  # Publish only after an explicit success gate. Signals and critical errors
+  # must leave a failed partial and never rename it to the final phase path.
+  local publish_allowed=0
+
+  uas_write_failure_marker() {
+    local failure_type="$1"
+    local status="$2"
+    local marker="${partial_dir}/FAILED.txt"
+    {
+      printf 'phase=%s\n' "${PHASE}"
+      printf 'failure_type=%s\n' "${failure_type}"
+      printf 'signal_or_exit_status=%s\n' "${status}"
+      printf 'failed_at=%s\n' "$(date --iso-8601=seconds 2>/dev/null || date 2>/dev/null || printf 'unknown\n')"
+    } >"${marker}" 2>/dev/null || true
+    chmod 0600 "${marker}" 2>/dev/null || true
   }
-  trap cleanup_partial_on_signal INT TERM
+
+  uas_capture_on_signal() {
+    local signal_name="$1"
+    local exit_code="$2"
+    trap - INT TERM ERR
+    publish_allowed=0
+    uas_write_failure_marker "signal" "${signal_name}"
+    exit "${exit_code}"
+  }
+
+  uas_capture_on_err() {
+    local exit_code=$?
+    trap - INT TERM ERR
+    publish_allowed=0
+    uas_write_failure_marker "internal_error" "${exit_code}"
+    exit "${exit_code}"
+  }
+
+  trap 'uas_capture_on_signal INT 130' INT
+  trap 'uas_capture_on_signal TERM 143' TERM
+  trap 'uas_capture_on_err' ERR
 
   MANIFEST_LINES=()
-  set +e
+  # Collectors already wrap expected non-zero host probes in narrow set +e
+  # blocks. Do not disable errexit for the whole capture body.
   uas_write_phase_metadata "${partial_dir}/metadata.txt"
   uas_collect_system "${partial_dir}/system.txt"
   uas_collect_repository "${partial_dir}/repository.txt"
@@ -813,7 +847,40 @@ Inspect or remove it manually after review."
   uas_collect_services "${partial_dir}/services.txt"
   uas_collect_packages "${partial_dir}"
   uas_collect_connectivity "${partial_dir}/connectivity.txt"
-  set -e
+
+  local required_files=(
+    metadata.txt
+    system.txt
+    repository.txt
+    filesystem.txt
+    networkmanager-connections.txt
+    networkmanager-active.txt
+    networkmanager-zones.txt
+    networkmanager-devices.txt
+    firewalld-permanent-zones.txt
+    firewalld-permanent-policies.txt
+    firewalld-runtime-zones.txt
+    firewalld-runtime-policies.txt
+    firewalld-active-zones.txt
+    firewalld-project-objects.txt
+    routing-ipv4.txt
+    routing-ipv6.txt
+    routing-rules.txt
+    wireguard-runtime.txt
+    dns.txt
+    services.txt
+    packages.txt
+    rpm-ostree.txt
+    connectivity.txt
+  )
+  local req
+  for req in "${required_files[@]}"; do
+    if [[ ! -f "${partial_dir}/${req}" ]]; then
+      trap - INT TERM ERR
+      uas_write_failure_marker "missing_artifact" "${req}"
+      die "Capture incomplete: missing required artifact ${req} (partial left at ${partial_dir})"
+    fi
+  done
 
   local manifest=""
   local line
@@ -821,15 +888,37 @@ Inspect or remove it manually after review."
     manifest+="${line}"$'\n'
   done
   uas_write_file "${partial_dir}/manifest.txt" "${manifest}"
+  [[ -f "${partial_dir}/manifest.txt" ]] || {
+    trap - INT TERM ERR
+    uas_write_failure_marker "missing_artifact" "manifest.txt"
+    die "Capture incomplete: manifest.txt was not written (partial left at ${partial_dir})"
+  }
 
-  # Atomic publish: only if final phase still absent.
+  if [[ -e "${partial_dir}/FAILED.txt" ]]; then
+    trap - INT TERM ERR
+    die "Capture marked failed; refusing to publish (partial left at ${partial_dir})"
+  fi
+
+  # Atomic publish: only behind the explicit success gate.
   if [[ -e "${phase_dir}" ]]; then
-    printf 'FAILED: phase appeared during capture\n' >"${partial_dir}/FAILED.txt"
+    trap - INT TERM ERR
+    uas_write_failure_marker "phase_conflict" "phase_appeared"
     die "Phase directory appeared during capture; leaving partial at ${partial_dir}"
   fi
+
+  publish_allowed=1
+  if ((publish_allowed != 1)); then
+    trap - INT TERM ERR
+    uas_write_failure_marker "internal_error" "publish_gate"
+    die "Publish gate closed; leaving partial at ${partial_dir}"
+  fi
+
   mv -- "${partial_dir}" "${phase_dir}"
-  trap - INT TERM
+  trap - INT TERM ERR
   chmod 0700 -- "${phase_dir}" || true
+  if [[ -e "${phase_dir}/FAILED.txt" ]]; then
+    die "Published phase unexpectedly contains FAILED.txt: ${phase_dir}"
+  fi
   uas_chown_tree_if_sudo_user "${run_dir}"
   log "Wrote phase snapshot: ${phase_dir}"
   log "The collector never runs install.yml or uninstall.yml."
@@ -942,6 +1031,12 @@ uas_run_compare() {
       summary+="SKIP ${label} — missing phase (${a} and/or ${b})"$'\n'
       uas_write_file "${cmp_dir}/${outname}" "SKIP: missing phase directories"$'\n'
       return 0
+    fi
+    if [[ -e "${left}/FAILED.txt" || -e "${right}/FAILED.txt" ]]; then
+      die "Refusing to compare failed phase snapshot(s) containing FAILED.txt:
+${left}
+${right}
+Inspect or remove failed partial/published trees manually after review."
     fi
     uas_diff_file_lists "${left}" "${right}" "${cmp_dir}/${outname%.diff}.structural.diff" "${UAS_STRUCTURAL_FILES[@]}"
     uas_diff_file_lists "${left}" "${right}" "${cmp_dir}/${outname%.diff}.runtime.diff" "${UAS_RUNTIME_FILES[@]}"

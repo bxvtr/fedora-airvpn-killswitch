@@ -260,6 +260,17 @@ It does **not**:
 - mutate NetworkManager, firewalld, WireGuard, services, or packages
 - overwrite an existing phase directory (there is no `--force`)
 
+Successful captures publish a final `<run>/<phase>/` directory only after all
+required artifacts are written (atomic rename from a private partial). If the
+collector is interrupted (`SIGINT`/`SIGTERM`) or hits a critical internal error,
+the final phase path is **not** created; a failed partial may remain under
+`<run>/.<phase>.partial.<pid>/` with a `FAILED.txt` marker. Remove or keep
+that partial after manual review before reusing the same `--run-name`/`--phase`.
+Compare mode refuses phase directories that contain `FAILED.txt`.
+
+Missing optional tools still record `SKIP`/`WARN` in the manifest and do **not**
+by themselves block a successful publish.
+
 Run it yourself as root. Default output root is
 `/var/tmp/fedora-airvpn-uninstall-audit` so the same `--run-name` survives a
 reboot (`/tmp` is often wiped). Artifacts may contain network metadata (zones,

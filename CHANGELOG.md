@@ -28,6 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Prevent `tools/uninstall-audit-snapshot` from publishing an incomplete phase
+  after `SIGINT`/`SIGTERM` or critical internal errors: signal handlers exit
+  non-zero (130/143), capture collectors no longer run under a broad `set +e`,
+  publish requires an explicit success gate, failed partials keep `FAILED.txt`,
+  and compare mode refuses phases that contain that marker.
 - Prompt for the Ansible become password from `bootstrap.sh` via
   `--ask-become-pass` on live and check-mode install runs; refuse root/sudo
   bootstrap so repository-local `.venv` / `.ansible` stay user-owned; document
