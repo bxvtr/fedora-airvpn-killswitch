@@ -214,7 +214,12 @@ uas_append_manifest() {
 uas_interruptible_cmd() {
   local tmp pid rc=0
   tmp="$(mktemp)"
-  "$@" >"${tmp}" 2>&1 &
+  # Child ignores SIGINT so Ctrl+C / kill -INT is handled by the capture shell
+  # trap instead of being consumed by the probe process.
+  (
+    trap '' INT
+    exec "$@" >"${tmp}" 2>&1
+  ) &
   pid=$!
   set +e
   wait "${pid}"
@@ -389,19 +394,26 @@ uas_collect_networkmanager() {
   fi
   # Explicit non-secret fields only (never request secret display; no full show; no export).
   set +e
-  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show)"
   rc=$?
   set -e
+  out="$(printf '%s\n' "${out}" | LC_ALL=C sort)"
   uas_write_file "${dir}/networkmanager-connections.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
 
   set +e
-  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE connection show --active | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE connection show --active)"
   rc=$?
   set -e
+  out="$(printf '%s\n' "${out}" | LC_ALL=C sort)"
   uas_write_file "${dir}/networkmanager-active.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
 
   local zones="" line uuid
   zones+="=== connection.zone / autoconnect / interface-name (explicit -g fields) ==="$'\n'
+  local uuid_list=""
+  set +e
+  uuid_list="$(uas_interruptible_cmd nmcli -t -f UUID connection show)"
+  set -e
+  uuid_list="$(printf '%s\n' "${uuid_list}" | LC_ALL=C sort)"
   while IFS= read -r line; do
     [[ -n "${line}" ]] || continue
     uuid="${line%%:*}"
@@ -411,13 +423,14 @@ uas_collect_networkmanager() {
     rc=$?
     set -e
     zones+="UUID=${uuid}"$'\n'"${out}"$'\n'"[exit=${rc}]"$'\n'
-  done < <(uas_interruptible_cmd nmcli -t -f UUID connection show 2>/dev/null | LC_ALL=C sort || true)
+  done <<<"${uuid_list}"
   uas_write_file "${dir}/networkmanager-zones.txt" "${zones}"
 
   set +e
-  out="$(uas_interruptible_cmd nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status)"
   rc=$?
   set -e
+  out="$(printf '%s\n' "${out}" | LC_ALL=C sort)"
   uas_write_file "${dir}/networkmanager-devices.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
   uas_append_manifest "PASS networkmanager-*.txt"
 }
