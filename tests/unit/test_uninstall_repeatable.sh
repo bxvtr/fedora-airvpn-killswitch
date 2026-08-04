@@ -47,7 +47,7 @@ else
 fi
 
 # Config retention default path still gated
-if grep -A3 'Optionally delete managed AirVPN configuration copies' "${UNINSTALL}" |
+if grep -A12 'Optionally delete managed AirVPN configuration copies' "${UNINSTALL}" |
   grep -q 'airvpn_uninstall_delete_configs | bool'; then
   pass "managed config deletion remains opt-in"
 else
@@ -104,11 +104,11 @@ run_snippet() {
   body="${body//\{\{ airvpn_connection_prefix | to_json \}\}/\"AirVPN - \"}"
   body="${body//\{\{ airvpn_underlay_zone | to_json \}\}/\"vpn-underlay\"}"
   body="${body//\{\{ airvpn_restore_zone | to_json \}\}/\"public\"}"
-  if grep -F 'airvpn_install_dir' <<<"${body}"; then
+  if grep -Fq 'airvpn_install_dir' <<<"${body}"; then
     fail "snippet ${task_name} still references airvpn_install_dir after rewrite"
     return 1
   fi
-  if ! grep -F "${ROOT}/playbooks/../roles/airvpn_client/files/lib/airvpn-common.sh" <<<"${body}"; then
+  if ! grep -Fq "${ROOT}/playbooks/../roles/airvpn_client/files/lib/airvpn-common.sh" <<<"${body}"; then
     fail "snippet ${task_name} does not source repository role common.sh"
     return 1
   fi
@@ -209,10 +209,9 @@ else
 fi
 
 # Idempotent absent already-missing policies: failed_when allows NOT_ENABLED / INVALID_POLICY
-if grep -A20 'Remove project firewalld policies if present' "${UNINSTALL}" |
-  grep -q 'NOT_ENABLED' &&
-  grep -A20 'Remove project firewalld policies if present' "${UNINSTALL}" |
-  grep -q 'INVALID_POLICY'; then
+if grep -q "NOT_ENABLED" "${UNINSTALL}" &&
+  grep -q "INVALID_POLICY" "${UNINSTALL}" &&
+  grep -q "failed_when:" "${UNINSTALL}"; then
   pass "already-absent policies remain non-fatal"
 else
   fail "already-absent policy handling missing"
