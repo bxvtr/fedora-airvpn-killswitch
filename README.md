@@ -17,7 +17,9 @@ THE SOFTWARE IS PROVIDED **WITHOUT WARRANTY**. Users must verify behavior on the
 - If WireGuard activation or handshake verification fails, the system fails closed.
 - After boot, before manual VPN activation, ordinary Internet traffic is blocked (managed profiles have `autoconnect` disabled).
 - Installation imports managed AirVPN profiles but leaves them inactive; activate one explicitly with `airvpn-switch`.
-- After suspend/resume, traffic either continues through an still-active VPN or remains blocked.
+- The design is intended to remain fail-closed across connection changes, but
+  suspend/resume and physical Wi-Fi lifecycle behavior have not yet been live
+  validated.
 - Physical Wi-Fi/Ethernet may send only required WireGuard handshake traffic to explicitly allowed numeric AirVPN endpoints (plus minimal DHCP/NDP allowances).
 - Traffic via the managed AirVPN interface is allowed.
 - IPv4 and IPv6 are both considered when enabled.
@@ -26,7 +28,7 @@ THE SOFTWARE IS PROVIDED **WITHOUT WARRANTY**. Users must verify behavior on the
 
 **Limitations**
 
-- Version 1 supports **direct-on-host** Ansible only (controller == managed host).
+- Direct-on-host Ansible only for this release (`v0.1.0`): controller == managed host.
 - Hostname-based WireGuard `Endpoint` values are **rejected** (they need pre-tunnel DNS).
 - All imported numeric endpoints are allowed persistently (not “current endpoint only”).
 - Local LAN access via the underlay is blocked by the default kill switch (fail closed).
@@ -38,7 +40,7 @@ THE SOFTWARE IS PROVIDED **WITHOUT WARRANTY**. Users must verify behavior on the
 
 ## Supported systems
 
-**Target platform family (version 1)**
+**Target platform family (v0.1.0)**
 
 - Fedora Workstation
 - Fedora Spins using NetworkManager and firewalld
@@ -280,7 +282,11 @@ state. It does **not** prove real kill-switch or leak-prevention behavior.
 | `airvpn-protect-connection NAME\|UUID` | Protect a new Wi-Fi/Ethernet profile |
 
 Wrappers are installed under `/usr/local/bin`; implementation scripts live under
-`/usr/local/libexec/airvpn-client`. Runtime commands require root via `sudo`.
+`/usr/local/libexec/airvpn-client`. Commands that modify NetworkManager,
+firewalld, VPN state, or managed files require root. Read-only status and
+diagnostic operations may support non-root execution, depending on the
+requested checks (`airvpn-status` and `airvpn-check` do not call the project
+root gate; mutating commands such as `airvpn-switch` do).
 
 ### Activate, switch, or disconnect
 
@@ -332,7 +338,11 @@ Checks cover commands/services, zones/policies, endpoint exceptions, autoconnect
 
 ## Suspend / resume
 
-Managed AirVPN profiles are configured with `connection.autoconnect no`. After resume, if the tunnel is down, the underlay kill switch should continue blocking ordinary traffic until you run `airvpn-switch` again.
+Managed AirVPN profiles are configured with `connection.autoconnect no`. The
+design is intended to remain fail-closed across connection changes: if the
+tunnel is down after resume, the underlay kill switch should continue blocking
+ordinary traffic until you run `airvpn-switch` again. Suspend/resume and
+physical Wi-Fi lifecycle behavior have **not** yet been live validated.
 
 ## Adding a new Wi-Fi or Ethernet profile
 
@@ -426,11 +436,13 @@ validate NetworkManager/WireGuard/firewalld traffic. See
 - No current-endpoint-only firewall mode
 - Broad underlay REJECT also blocks LAN unless you intentionally change policy (not recommended without understanding the risk)
 
-## Known limitations
-
 See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) for live-validated
 results, statically identified gaps, Wi-Fi status, uninstall restore-zone
 behavior, and retained managed configurations.
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## Roadmap
 

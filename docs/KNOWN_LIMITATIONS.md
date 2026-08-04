@@ -61,6 +61,9 @@ In that controlled run, the following were observed:
   - Package and rpm-ostree state matched the baseline.
   - Ordinary Internet access and DNS worked again.
   - `/run/airvpn-client.lock` was gone after reboot.
+- Repeated uninstall (`install → first uninstall → second uninstall`) completed
+  successfully on the same Silverblue 43 host after the repository-sourced
+  common-library fix.
 
 No project firewalld policies, project zones, managed VPN profiles, WireGuard
 runtime state, or project routing rules remained after the validated uninstall
@@ -84,10 +87,11 @@ Examples (non-exhaustive):
 - Physical Wi-Fi hardware and Wi-Fi lifecycle scenarios
 - Physical Ethernet hardware (live run used virtual Ethernet)
 - Connections created after installation (automatic underlay assignment)
-- Repeated uninstall on the same host after a successful first uninstall
 - Concurrent uninstall while mutating runtime commands hold the project lock
 - Pre-existing firewalld zones/policies that already use project object names
 - Suspend/resume, roaming, airplane mode, dual uplinks, tethering, captive portals
+- General recovery after arbitrary partial uninstall failures (beyond the
+  repository-sourced runtime-library path fixed for repeatable uninstall)
 - Package-based Fedora Workstation or Spin hosts as live integration targets
 - Broader Fedora editions beyond the Silverblue 43 VM above
 
@@ -226,8 +230,8 @@ config directory manually after review.
 
 ### Repeated Uninstall
 
-**Status:** Fixed in source (mocked unit coverage); not yet re-validated live
-on Fedora Silverblue 43 after the fix.
+**Status:** Live validated on Fedora Silverblue 43
+(`install → first uninstall → second uninstall`).
 
 **Impact (historical):** A second uninstall could fail early because NetworkManager
 cleanup tasks sourced installed
@@ -240,8 +244,10 @@ used to run the playbook, so a second uninstall no longer depends on installed
 runtime libraries. Already-absent project policies/files remain non-fatal;
 managed configs stay retained unless `airvpn_uninstall_delete_configs=true`.
 
-**Remaining:** Confirm `install → uninstall → uninstall` once in the disposable
-Fedora Silverblue 43 VM. See [ROADMAP.md](../ROADMAP.md) (`v0.1.x`).
+**Remaining:** General recovery after arbitrary partial uninstall failures is
+**not** fully live validated. Uninstall still does not acquire the shared
+runtime project lock (see [Concurrent Runtime Operations](#concurrent-runtime-operations)).
+Further hardening items remain in [ROADMAP.md](../ROADMAP.md) (`v0.1.x`).
 
 ### Concurrent Runtime Operations
 
@@ -281,10 +287,13 @@ you share the host with other firewall automation.
 | Topic | Status | Practical note |
 | --- | --- | --- |
 | Fail-closed without VPN (validated path) | Live validated (Silverblue 43 / vEth) | Still verify with `airvpn-check` on your host |
+| Repeated uninstall | Live validated (Silverblue 43) | Still does not take the runtime project lock |
 | New physical profiles | Not yet validated | Use `airvpn-protect-connection` |
 | Wi-Fi hardware / lifecycle | Not yet validated | Do not assume radio scenarios match the VM Ethernet run |
+| Suspend/resume / dual uplink | Not yet live validated | Do not treat intended design as confirmed |
 | Restore zone ≠ original zone | Live confirmed + intentional | Review zones after uninstall |
 | Retained managed configs | Intentional default | Treat `/etc/airvpn-client/configs` as secrets |
+| Audit snapshot incomplete publish | Fixed (atomic success gate) | Leftover `.<phase>.partial.<pid>` dirs need manual cleanup |
 | `/run/airvpn-client.lock` until reboot | Intentional / cosmetic | Cleared by reboot; not a persistent project install |
 | Controller `.venv` / `.ansible` | Intentional | Repository-local; not removed by host uninstall |
 | Packages / enabled NM+firewalld | Intentional | System prerequisites; not rolled back |

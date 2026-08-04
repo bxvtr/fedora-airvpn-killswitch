@@ -12,12 +12,17 @@ clearer without redesigning network lifecycle automation:
 
 - [x] Make uninstall safely repeatable after a successful first run
   (repository-sourced `airvpn-common.sh` for NM cleanup; mocked unit test;
-  live `install → uninstall → uninstall` on Fedora Silverblue 43 still
-  recommended).
+  live `install → uninstall → uninstall` validated on Fedora Silverblue 43).
+- [x] Harden uninstall audit snapshot publish and signal paths (atomic success
+  gate; incomplete captures not published as final phases; best-effort
+  `FAILED.txt`; compare rejects marked phases).
 - Add stronger post-uninstall verification (zones, profiles, paths, optional
   machine-readable checks).
-- Improve handling of partial uninstall failures (beyond the shared
-  runtime-library dependency already removed for NM cleanup).
+- Improve handling of partial uninstall failures beyond the repeatable-uninstall
+  path already fixed (general recovery after arbitrary partial failures remains
+  open).
+- Have uninstall acquire the shared runtime project lock used by mutating
+  `airvpn-*` commands.
 - Improve the uninstall audit collector formatting and deterministic output.
 - Clarify retained managed configuration and restore-zone behavior in operator
   messaging where helpful.
