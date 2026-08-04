@@ -385,10 +385,17 @@ fi
 # run-metadata exists once
 [[ -f "${OUT1}/runA/run-metadata.txt" ]] && pass "run-metadata.txt created" || fail "missing run-metadata"
 
-# CI / validate-safe must not invoke collector
-if grep -R -n 'uninstall-audit-snapshot' "${ROOT}/.github/workflows" "${ROOT}/tools/validate-safe" 2>/dev/null |
-  grep -E 'run:|bash |^\s*\./tools/uninstall' | grep -q .; then
-  fail "CI or validate-safe appears to execute uninstall-audit-snapshot"
+# CI / validate-safe must not invoke collector as a command.
+# Guard patterns that mention the tool name (ShellCheck find -name, grep bans)
+# are allowed; only YAML run-steps / direct invocations fail this check.
+if grep -E -q \
+  '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+  "${ROOT}/.github/workflows/"*.yml 2>/dev/null; then
+  fail "CI workflows must not execute tools/uninstall-audit-snapshot"
+elif grep -E -q \
+  '^[[:space:]]*(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+  "${ROOT}/tools/validate-safe"; then
+  fail "validate-safe must not invoke tools/uninstall-audit-snapshot"
 else
   pass "CI/validate-safe do not auto-run uninstall-audit-snapshot"
 fi

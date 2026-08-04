@@ -122,6 +122,24 @@ uas_output_root_is_safe() {
   local repo="$2"
   local resolved
   [[ -n "${path}" && "${path}" == /* ]] || return 1
+  # Reject symlink components on the caller-supplied path before canonicalization.
+  # readlink -m resolves symlinks, so checking only the resolved path would miss
+  # a symlink leaf such as /var/tmp/audit -> /var/tmp/real.
+  if [[ -L "${path}" ]]; then
+    return 1
+  fi
+  local cur="" part
+  local IFS='/'
+  # shellcheck disable=SC2086
+  set -- ${path#/}
+  cur=""
+  for part in "$@"; do
+    [[ -n "${part}" ]] || continue
+    cur="${cur}/${part}"
+    if [[ -L "${cur}" ]]; then
+      return 1
+    fi
+  done
   resolved="$(readlink -m -- "${path}")"
   [[ -n "${resolved}" && "${resolved}" == /* ]] || return 1
   case "${resolved}" in
@@ -140,18 +158,6 @@ uas_output_root_is_safe() {
       "${repo}" | "${repo}"/*) return 1 ;;
     esac
   fi
-  # Reject if any existing path component is a symlink (symlink escape).
-  local cur="" part
-  local IFS='/'
-  # shellcheck disable=SC2086
-  set -- ${resolved#/}
-  cur=""
-  for part in "$@"; do
-    cur="${cur}/${part}"
-    if [[ -L "${cur}" ]]; then
-      return 1
-    fi
-  done
   return 0
 }
 

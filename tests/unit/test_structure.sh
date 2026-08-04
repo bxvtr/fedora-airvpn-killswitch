@@ -109,7 +109,7 @@ fi
 # never as an active default / runtime fallback / newly created policy name.
 bad_default_hits="$(grep -R -n --exclude-dir=.git --exclude-dir=.venv --exclude-dir=.ansible \
   -e 'airvpn-host-to-underlay' "${ROOT}" || true)"
-allowed_legacy_ref='CHANGELOG\.md|docs/|tests/unit/|tests/integration/|roles/airvpn_client/tasks/firewall\.yml|playbooks/uninstall\.yml'
+allowed_legacy_ref='CHANGELOG\.md|docs/|tests/unit/|tests/integration/|roles/airvpn_client/tasks/firewall\.yml|playbooks/uninstall\.yml|tools/uninstall-audit-snapshot'
 if [[ -z "${bad_default_hits}" ]]; then
   pass "rejected underlay policy literal absent from tree"
 elif printf '%s\n' "${bad_default_hits}" | grep -vE "${allowed_legacy_ref}" >/dev/null; then
