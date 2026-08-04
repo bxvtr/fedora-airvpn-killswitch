@@ -59,8 +59,10 @@ Safety:
   - Requires root for capture (incomplete read-only data otherwise)
   - Refuses to overwrite an existing phase directory (no --force)
   - Publishes each phase atomically from a private partial directory
-  - Interrupted or critically failed captures leave a failed partial and
-    never publish a final phase directory
+  - Interrupted or critically failed captures leave an incomplete partial
+    (never a final phase). FAILED.txt is best-effort diagnostics; the
+    partial directory name alone marks incompleteness. Marker write failures
+    are reported on stderr. Remove leftover partials manually before retry.
   - Does not read WireGuard private material or NetworkManager keyfile secrets
   - Artifacts may still contain network metadata (zones, endpoints, public IPs)
 
@@ -805,15 +807,20 @@ Choose a different --run-name or remove the old audit run manually after review.
   fi
   if [[ -e "${partial_dir}" ]]; then
     die "Refusing to reuse existing partial directory:
-${partial_dir}"
+${partial_dir}
+
+A previous incomplete capture left this partial. Review its contents and
+remove that directory manually before retrying the same --run-name/--phase."
   fi
   # Any other partial for this phase?
   local other
   for other in "${run_dir}/.${PHASE}.partial."*; do
     if [[ -e "${other}" ]]; then
-      die "Refusing to proceed while a prior partial directory exists:
+      die "Refusing to proceed while a prior incomplete capture exists:
 ${other}
-Inspect or remove it manually after review."
+
+Partials are incomplete by name (.<phase>.partial.<pid>). Review the
+directory and remove it manually before retrying the same --run-name/--phase."
     fi
   done
 
@@ -830,25 +837,63 @@ Inspect or remove it manually after review."
   # must leave a failed partial and never rename it to the final phase path.
   local publish_allowed=0
 
+  # Writes FAILED.txt as best-effort diagnostics. Returns 0 on success, 1 on
+  # failure (and prints a WARNING). Never replaces the caller's exit status.
+  # Partials remain incomplete by directory name even when this returns 1.
   uas_write_failure_marker() {
     local failure_type="$1"
     local status="$2"
     local marker="${partial_dir}/FAILED.txt"
-    {
-      printf 'phase=%s\n' "${PHASE}"
-      printf 'failure_type=%s\n' "${failure_type}"
-      printf 'signal_or_exit_status=%s\n' "${status}"
-      printf 'failed_at=%s\n' "$(date --iso-8601=seconds 2>/dev/null || date 2>/dev/null || printf 'unknown\n')"
-    } >"${marker}" 2>/dev/null || true
-    chmod 0600 "${marker}" 2>/dev/null || true
+    local tmp=""
+    local body=""
+
+    # Test-only hook (requires UAS_SKIP_ROOT_CHECK=1). Disabled by default.
+    if [[ "${UAS_SKIP_ROOT_CHECK:-}" == "1" && "${UAS_TEST_FAIL_MARKER_WRITE:-}" == "1" ]]; then
+      printf '[uninstall-audit-snapshot] WARNING: could not write FAILED.txt under %s (test hook)\n' \
+        "${partial_dir}" >&2
+      return 1
+    fi
+
+    body+="phase=${PHASE}"$'\n'
+    body+="failure_type=${failure_type}"$'\n'
+    body+="signal_or_exit_status=${status}"$'\n'
+    body+="failed_at=$(date --iso-8601=seconds 2>/dev/null || date 2>/dev/null || printf 'unknown')"$'\n'
+
+    if ! tmp="$(mktemp "${marker}.tmp.XXXXXX" 2>/dev/null)"; then
+      printf '[uninstall-audit-snapshot] WARNING: could not create FAILED.txt temp file under %s\n' \
+        "${partial_dir}" >&2
+      return 1
+    fi
+    if ! printf '%s' "${body}" >"${tmp}" 2>/dev/null; then
+      rm -f -- "${tmp}" 2>/dev/null || true
+      printf '[uninstall-audit-snapshot] WARNING: could not write FAILED.txt under %s\n' \
+        "${partial_dir}" >&2
+      return 1
+    fi
+    chmod 0600 "${tmp}" 2>/dev/null || true
+    if ! mv -f -- "${tmp}" "${marker}" 2>/dev/null; then
+      rm -f -- "${tmp}" 2>/dev/null || true
+      printf '[uninstall-audit-snapshot] WARNING: could not publish FAILED.txt under %s\n' \
+        "${partial_dir}" >&2
+      return 1
+    fi
+    return 0
   }
 
+  uas_warn_unmarked_partial() {
+    printf '[uninstall-audit-snapshot] WARNING: incomplete capture left an unmarked partial:\n%s\n' \
+      "${partial_dir}" >&2
+    printf 'Partials are incomplete by name. Review and remove that directory manually before retrying the same --run-name/--phase.\n' >&2
+  }
+
+  # Keep EXIT armed so a failed marker still gets a fallback attempt. Clear
+  # INT/TERM only to avoid re-entrant signal handling.
   uas_capture_on_signal() {
     local signal_name="$1"
     local exit_code="$2"
-    trap - INT TERM EXIT
+    trap - INT TERM
     publish_allowed=0
-    uas_write_failure_marker "signal" "${signal_name}"
+    uas_write_failure_marker "signal" "${signal_name}" || true
     # Stop children blocked in host probes so a deferred wait cannot resume
     # into the publish path after the signal handler returns.
     pkill -P "$$" >/dev/null 2>&1 || true
@@ -857,10 +902,15 @@ Inspect or remove it manually after review."
 
   uas_capture_on_exit() {
     local exit_code=$?
+    # Prevent re-entry if marker I/O somehow retriggers EXIT semantics.
+    trap - EXIT
     # If the partial directory still exists, publish did not complete.
     if [[ -d "${partial_dir}" && ! -e "${phase_dir}" ]]; then
       if [[ ! -e "${partial_dir}/FAILED.txt" ]]; then
-        uas_write_failure_marker "aborted" "${exit_code}"
+        uas_write_failure_marker "aborted" "${exit_code}" || true
+      fi
+      if [[ ! -e "${partial_dir}/FAILED.txt" ]]; then
+        uas_warn_unmarked_partial
       fi
     fi
   }
@@ -914,8 +964,8 @@ Inspect or remove it manually after review."
   local req
   for req in "${required_files[@]}"; do
     if [[ ! -f "${partial_dir}/${req}" ]]; then
-      trap - INT TERM EXIT
-      uas_write_failure_marker "missing_artifact" "${req}"
+      trap - INT TERM
+      uas_write_failure_marker "missing_artifact" "${req}" || true
       die "Capture incomplete: missing required artifact ${req} (partial left at ${partial_dir})"
     fi
   done
@@ -927,27 +977,27 @@ Inspect or remove it manually after review."
   done
   uas_write_file "${partial_dir}/manifest.txt" "${manifest}"
   [[ -f "${partial_dir}/manifest.txt" ]] || {
-    trap - INT TERM EXIT
-    uas_write_failure_marker "missing_artifact" "manifest.txt"
+    trap - INT TERM
+    uas_write_failure_marker "missing_artifact" "manifest.txt" || true
     die "Capture incomplete: manifest.txt was not written (partial left at ${partial_dir})"
   }
 
   if [[ -e "${partial_dir}/FAILED.txt" ]]; then
-    trap - INT TERM EXIT
+    trap - INT TERM
     die "Capture marked failed; refusing to publish (partial left at ${partial_dir})"
   fi
 
   # Atomic publish: only behind the explicit success gate.
   if [[ -e "${phase_dir}" ]]; then
-    trap - INT TERM EXIT
-    uas_write_failure_marker "phase_conflict" "phase_appeared"
+    trap - INT TERM
+    uas_write_failure_marker "phase_conflict" "phase_appeared" || true
     die "Phase directory appeared during capture; leaving partial at ${partial_dir}"
   fi
 
   publish_allowed=1
   if ((publish_allowed != 1)); then
-    trap - INT TERM EXIT
-    uas_write_failure_marker "internal_error" "publish_gate"
+    trap - INT TERM
+    uas_write_failure_marker "internal_error" "publish_gate" || true
     die "Publish gate closed; leaving partial at ${partial_dir}"
   fi
 

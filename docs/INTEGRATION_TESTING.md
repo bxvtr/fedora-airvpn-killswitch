@@ -263,10 +263,13 @@ It does **not**:
 Successful captures publish a final `<run>/<phase>/` directory only after all
 required artifacts are written (atomic rename from a private partial). If the
 collector is interrupted (`SIGINT`/`SIGTERM`) or hits a critical internal error,
-the final phase path is **not** created; a failed partial may remain under
-`<run>/.<phase>.partial.<pid>/` with a `FAILED.txt` marker. Remove or keep
-that partial after manual review before reusing the same `--run-name`/`--phase`.
-Compare mode refuses phase directories that contain `FAILED.txt`.
+the final phase path is **not** created. A private partial may remain under
+`<run>/.<phase>.partial.<pid>/`. That directory name alone marks the capture as
+incomplete; `FAILED.txt` is additional diagnostics when the filesystem allows
+writing it. If the marker cannot be written, the collector prints a warning on
+stderr. Review and remove leftover partials manually before retrying the same
+`--run-name`/`--phase` (nothing auto-deletes them). Compare mode uses only final
+phase directories and refuses any final phase that contains `FAILED.txt`.
 
 Missing optional tools still record `SKIP`/`WARN` in the manifest and do **not**
 by themselves block a successful publish.

@@ -512,18 +512,27 @@ else
 fi
 
 # SIGINT shares the abort-without-publish handler with SIGTERM. A live SIGINT
-# kill against a hanging foreground/background child is not reliable across
-# bash versions (SIGINT can be treated as handled by the child). Cover INT via
-# the shared trap contract; cover behavioral abort with SIGTERM below.
+# kill against a hanging child is not reliable across bash versions. Cover INT
+# via the shared trap contract; cover behavioral abort with SIGTERM below.
 if grep -q "trap 'uas_capture_on_signal INT 130' INT" "${SCRIPT}" &&
   grep -q "trap 'uas_capture_on_signal TERM 143' TERM" "${SCRIPT}" &&
-  grep -q 'trap '\'''\'' INT' "${SCRIPT}"; then
+  grep -q "trap '' INT" "${SCRIPT}"; then
   pass "SIGINT trap aborts via shared handler; probe children ignore SIGINT"
 else
   fail "SIGINT shared-handler / child-ignore contract missing"
 fi
 
-# SIGTERM during hanging collector: no final phase, exit 143
+# Signal handler must keep EXIT armed for marker fallback
+sig_fn="$(awk '/uas_capture_on_signal\(\)/,/^  uas_capture_on_exit\(\)/ {print}' "${SCRIPT}")"
+if grep -q 'trap - INT TERM EXIT' <<<"${sig_fn}"; then
+  fail "signal handler clears EXIT before marker/fallback"
+elif grep -q 'trap - INT TERM' <<<"${sig_fn}" && grep -q 'uas_capture_on_exit' "${SCRIPT}"; then
+  pass "signal handler keeps EXIT for marker fallback"
+else
+  fail "signal/EXIT trap contract missing"
+fi
+
+# SIGTERM during hanging collector: no final phase, exit 143, FAILED.txt when writable
 cat >"${MOCKBIN}/nmcli" <<'EOF'
 #!/usr/bin/env bash
 # Hang once so the unit test can deliver SIGTERM before publish.
@@ -552,10 +561,60 @@ if [[ "${sig_rc}" -eq 143 && ! -d "${OUT_SIG}/runSigTerm/baseline" ]]; then
   if [[ -n "${sp}" && -f "${sp}/FAILED.txt" ]] && grep -q 'failure_type=signal' "${sp}/FAILED.txt"; then
     pass "SIGTERM prevents publish and exits 143 with FAILED partial"
   else
-    pass "SIGTERM prevents publish and exits 143"
+    fail "SIGTERM missing FAILED.txt after successful marker path (rc=${sig_rc})"
   fi
 else
   fail "SIGTERM publish/exit semantics broken (rc=${sig_rc})"
+fi
+
+# Marker write failure must warn on stderr, keep signal exit code, never publish
+export UAS_TEST_FAIL_MARKER_WRITE=1
+sig_err="${TMP}/sig-marker.err"
+setsid bash "${SCRIPT}" --run-name runSigMark --phase baseline --output-root "${OUT_SIG}" \
+  >/dev/null 2>"${sig_err}" &
+sig_pid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30; do
+  sp_wait="$(find "${OUT_SIG}/runSigMark" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+  if [[ -n "${sp_wait}" && -f "${sp_wait}/metadata.txt" ]]; then
+    break
+  fi
+  sleep 0.1
+done
+kill -TERM -- "-${sig_pid}" 2>/dev/null || kill -TERM "${sig_pid}" 2>/dev/null || true
+set +e
+wait "${sig_pid}"
+sig_rc=$?
+set -e
+unset UAS_TEST_FAIL_MARKER_WRITE
+sp_mark="$(find "${OUT_SIG}/runSigMark" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | head -n1 || true)"
+if [[ "${sig_rc}" -eq 143 && ! -d "${OUT_SIG}/runSigMark/baseline" && -n "${sp_mark}" ]] &&
+  grep -q 'WARNING: could not write FAILED.txt' "${sig_err}" &&
+  grep -q 'unmarked partial\|incomplete capture left' "${sig_err}"; then
+  if [[ ! -e "${sp_mark}/FAILED.txt" ]]; then
+    pass "marker write failure warns, keeps exit 143, leaves unmarked partial unpublished"
+  else
+    fail "test hook did not prevent FAILED.txt"
+  fi
+else
+  fail "marker write failure path broken (rc=${sig_rc})"
+fi
+
+# Unmarked partial blocks reuse; message names the path; no auto-delete
+OUT_REUSE="${TMP}/audit-reuse"
+mkdir -p "${OUT_REUSE}/runReuse/.baseline.partial.4242"
+printf 'leftover\n' >"${OUT_REUSE}/runReuse/.baseline.partial.4242/metadata.txt"
+set +e
+reuse_out="$(bash "${SCRIPT}" --run-name runReuse --phase baseline --output-root "${OUT_REUSE}" 2>&1)"
+reuse_rc=$?
+set -e
+if [[ "${reuse_rc}" -eq 2 ]] &&
+  grep -q '\.baseline\.partial\.4242' <<<"${reuse_out}" &&
+  grep -qi 'incomplete' <<<"${reuse_out}" &&
+  grep -qi 'remove' <<<"${reuse_out}" &&
+  [[ -d "${OUT_REUSE}/runReuse/.baseline.partial.4242" ]]; then
+  pass "unmarked partial blocks retry with recovery path; not auto-deleted"
+else
+  fail "unmarked partial reuse handling broken (rc=${reuse_rc})"
 fi
 
 # Restore fast nmcli mock used earlier in this file
