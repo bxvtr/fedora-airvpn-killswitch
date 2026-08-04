@@ -208,6 +208,23 @@ uas_append_manifest() {
   MANIFEST_LINES+=("$1")
 }
 
+# Run an external probe in the background and wait so INT/TERM traps are not
+# deferred for the lifetime of a foreground child (bash may otherwise treat
+# SIGINT as handled by the child and resume the capture publish path).
+uas_interruptible_cmd() {
+  local tmp pid rc=0
+  tmp="$(mktemp)"
+  "$@" >"${tmp}" 2>&1 &
+  pid=$!
+  set +e
+  wait "${pid}"
+  rc=$?
+  set -e
+  cat "${tmp}"
+  rm -f -- "${tmp}"
+  return "${rc}"
+}
+
 uas_capture_cmd() {
   # uas_capture_cmd outfile label cmd...
   local outfile="$1"
@@ -220,7 +237,7 @@ uas_capture_cmd() {
     return 0
   fi
   set +e
-  out="$("$@" 2>&1)"
+  out="$(uas_interruptible_cmd "$@")"
   rc=$?
   set -e
   uas_write_file "${outfile}" "${out}"$'\n'"[exit=${rc}]"$'\n'
@@ -372,13 +389,13 @@ uas_collect_networkmanager() {
   fi
   # Explicit non-secret fields only (never request secret display; no full show; no export).
   set +e
-  out="$(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show 2>&1 | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show | LC_ALL=C sort)"
   rc=$?
   set -e
   uas_write_file "${dir}/networkmanager-connections.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
 
   set +e
-  out="$(nmcli -t -f UUID,NAME,TYPE,DEVICE connection show --active 2>&1 | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f UUID,NAME,TYPE,DEVICE connection show --active | LC_ALL=C sort)"
   rc=$?
   set -e
   uas_write_file "${dir}/networkmanager-active.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
@@ -390,15 +407,15 @@ uas_collect_networkmanager() {
     uuid="${line%%:*}"
     [[ -n "${uuid}" ]] || continue
     set +e
-    out="$(nmcli -g connection.zone,connection.autoconnect,connection.interface-name connection show "${uuid}" 2>&1)"
+    out="$(uas_interruptible_cmd nmcli -g connection.zone,connection.autoconnect,connection.interface-name connection show "${uuid}")"
     rc=$?
     set -e
     zones+="UUID=${uuid}"$'\n'"${out}"$'\n'"[exit=${rc}]"$'\n'
-  done < <(nmcli -t -f UUID connection show 2>/dev/null | LC_ALL=C sort || true)
+  done < <(uas_interruptible_cmd nmcli -t -f UUID connection show 2>/dev/null | LC_ALL=C sort || true)
   uas_write_file "${dir}/networkmanager-zones.txt" "${zones}"
 
   set +e
-  out="$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>&1 | LC_ALL=C sort)"
+  out="$(uas_interruptible_cmd nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status | LC_ALL=C sort)"
   rc=$?
   set -e
   uas_write_file "${dir}/networkmanager-devices.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
@@ -420,7 +437,7 @@ uas_fw_info_if_present() {
   fi
   local out rc=0
   set +e
-  out="$(firewall-cmd "${args[@]}" 2>&1)"
+  out="$(uas_interruptible_cmd firewall-cmd "${args[@]}")"
   rc=$?
   set -e
   if ((rc == 0)); then
