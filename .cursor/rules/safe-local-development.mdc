@@ -1,0 +1,64 @@
+---
+description: Safety guardrails for local Cursor agent work on this privileged networking repository
+alwaysApply: true
+---
+
+# Safe local development (Cursor agent)
+
+This repository configures NetworkManager, WireGuard, firewalld, and privileged
+Fedora host state. Treat every change as security-sensitive.
+
+## Default work mode
+
+Prefer source edits, static analysis, repository unit tests, and documentation.
+Do not perform live host-network or package operations during agent work.
+
+## Forbidden live operations
+
+Never execute live install, verify, or uninstall playbooks.
+`ansible-playbook` is allowed only with `--syntax-check`.
+
+Never invoke: `sudo`, `su`, `doas`, `firewall-cmd`, mutating `nmcli`, `wg`,
+`rpm-ostree`, `dnf`, `rpm`, `systemctl`, `reboot`, `shutdown`, `poweroff`,
+`ssh`, `scp`, or installed AirVPN runtime commands (`airvpn-import`,
+`airvpn-switch`, `airvpn-firewall-sync`, `airvpn-protect-connection`,
+`airvpn-killswitch`, and related wrappers).
+
+Never disable firewalld or the project kill switch.
+Never weaken fail-closed behavior merely to make tests pass.
+
+## Secrets and host state
+
+Never read files outside the workspace merely to discover credentials,
+WireGuard configs, NetworkManager profiles, or system state.
+Never request or print real AirVPN configuration contents.
+Keep real configs outside the clone; use only fake fixtures under
+`tests/fixtures/`.
+
+## No bypasses
+
+Do not bypass these restrictions through `bash -c`, `sh -c`, Python
+subprocesses, Make targets, aliases, wrapper scripts, or other indirect
+execution intended to run a forbidden command.
+
+## Validation and commits
+
+Use `tools/validate-safe` as the preferred static validation entry point.
+Use `tools/check-agent-safety` to verify Cursor safety files.
+Before proposing a commit, inspect the complete diff and secret-scan results.
+
+## Live integration tests
+
+Live Fedora NetworkManager/firewalld/WireGuard tests require explicit human
+authorization and should preferably run in a disposable VM with a snapshot.
+
+Never execute `tools/integration-test-vm` (or `./tools/integration-test-vm`)
+during ordinary agent work. It intentionally modifies live networking. Only run
+it when a human explicitly authorizes the live VM workflow and the command is
+launched manually inside that disposable guest. It must not be allowlisted for
+automatic execution. Do not invoke it from `tools/validate-safe`, pre-commit,
+bootstrap, or GitHub-hosted CI.
+
+## Language
+
+Repository content remains English. Communicate with the user in German.

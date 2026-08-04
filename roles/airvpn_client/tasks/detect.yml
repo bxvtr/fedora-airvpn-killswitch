@@ -1,0 +1,25 @@
+---
+- name: Assert operating system is Fedora
+  ansible.builtin.assert:
+    that:
+      - ansible_facts['os_family'] in airvpn_supported_os_families
+      - ansible_facts['distribution'] == 'Fedora'
+    fail_msg: >-
+      Unsupported distribution '{{ ansible_facts['distribution'] | default('unknown') }}'.
+      Version 1 supports Fedora Workstation, Fedora Spins, and Fedora Atomic
+      Desktops using NetworkManager and firewalld only.
+
+- name: Check for ostree boot marker
+  ansible.builtin.stat:
+    path: /run/ostree-booted
+  register: airvpn_ostree_marker
+
+- name: Set Fedora Atomic fact
+  ansible.builtin.set_fact:
+    airvpn_is_atomic: "{{ airvpn_ostree_marker.stat.exists | bool }}"
+
+- name: Report detected platform
+  ansible.builtin.debug:
+    msg: >-
+      Detected Fedora {{ ansible_facts['distribution_version'] }}
+      (atomic={{ airvpn_is_atomic }}).

@@ -1,0 +1,177 @@
+---
+# Create project zones and HOST->zone policy objects.
+# ansible.posix.firewalld manages zones but has no policy-object module in
+# ansible.posix 2.2.2, so policies use firewall-cmd with changed_when checks.
+#
+# Zone create/delete transactions must be permanent-only. Combining
+# permanent=true with immediate=true fails in ansible.posix.firewalld 2.2.2
+# ("Zone operations must be permanent"). Runtime activation uses an explicit
+# firewalld reload after permanent zone and policy changes.
+
+- name: Ensure airvpn firewalld zone exists permanently
+  ansible.posix.firewalld:
+    zone: "{{ airvpn_zone }}"
+    state: present
+    permanent: true
+  register: airvpn_zone_airvpn
+
+- name: Ensure underlay firewalld zone exists permanently
+  ansible.posix.firewalld:
+    zone: "{{ airvpn_underlay_zone }}"
+    state: present
+    permanent: true
+  register: airvpn_zone_underlay
+
+- name: Check whether VPN policy exists
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --info-policy {{ airvpn_policy_to_vpn }}
+  register: airvpn_pol_vpn_info
+  changed_when: false
+  failed_when: false
+
+- name: Create HOST to VPN policy
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --new-policy {{ airvpn_policy_to_vpn }}
+  when: airvpn_pol_vpn_info.rc != 0
+  register: airvpn_pol_vpn_create
+  changed_when: airvpn_pol_vpn_create.rc == 0
+
+- name: Ensure VPN policy ingress zone is HOST
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_vpn }} --add-ingress-zone=HOST
+  register: airvpn_pol_vpn_ingress
+  changed_when: "'ALREADY_ENABLED' not in airvpn_pol_vpn_ingress.stdout"
+  failed_when:
+    - airvpn_pol_vpn_ingress.rc != 0
+    - "'ALREADY_ENABLED' not in airvpn_pol_vpn_ingress.stdout"
+
+- name: Ensure VPN policy egress zone is airvpn zone
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_vpn }} --add-egress-zone={{ airvpn_zone }}
+  register: airvpn_pol_vpn_egress
+  changed_when: "'ALREADY_ENABLED' not in airvpn_pol_vpn_egress.stdout"
+  failed_when:
+    - airvpn_pol_vpn_egress.rc != 0
+    - "'ALREADY_ENABLED' not in airvpn_pol_vpn_egress.stdout"
+
+- name: Get VPN policy target
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_vpn }} --get-target
+  register: airvpn_pol_vpn_target
+  changed_when: false
+
+- name: Set VPN policy target to ACCEPT
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_vpn }} --set-target=ACCEPT
+  when: airvpn_pol_vpn_target.stdout | trim != 'ACCEPT'
+  register: airvpn_pol_vpn_set_target
+  changed_when: airvpn_pol_vpn_set_target.rc == 0
+
+- name: Check whether underlay policy exists
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --info-policy {{ airvpn_policy_to_underlay }}
+  register: airvpn_pol_underlay_info
+  changed_when: false
+  failed_when: false
+
+- name: Create HOST to underlay policy
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --new-policy {{ airvpn_policy_to_underlay }}
+  when: airvpn_pol_underlay_info.rc != 0
+  register: airvpn_pol_underlay_create
+  changed_when: airvpn_pol_underlay_create.rc == 0
+
+- name: Ensure underlay policy ingress zone is HOST
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_underlay }} --add-ingress-zone=HOST
+  register: airvpn_pol_underlay_ingress
+  changed_when: "'ALREADY_ENABLED' not in airvpn_pol_underlay_ingress.stdout"
+  failed_when:
+    - airvpn_pol_underlay_ingress.rc != 0
+    - "'ALREADY_ENABLED' not in airvpn_pol_underlay_ingress.stdout"
+
+- name: Ensure underlay policy egress zone is underlay zone
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_underlay }} --add-egress-zone={{ airvpn_underlay_zone }}
+  register: airvpn_pol_underlay_egress
+  changed_when: "'ALREADY_ENABLED' not in airvpn_pol_underlay_egress.stdout"
+  failed_when:
+    - airvpn_pol_underlay_egress.rc != 0
+    - "'ALREADY_ENABLED' not in airvpn_pol_underlay_egress.stdout"
+
+- name: Get underlay policy target
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_underlay }} --get-target
+  register: airvpn_pol_underlay_target
+  changed_when: false
+
+- name: Set underlay policy target to REJECT
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --policy {{ airvpn_policy_to_underlay }} --set-target=REJECT
+  when: airvpn_pol_underlay_target.stdout | trim not in ['REJECT', '%%REJECT%%']
+  register: airvpn_pol_underlay_set_target
+  changed_when: airvpn_pol_underlay_set_target.rc == 0
+
+# Migrate away from known former defaults only after current policies are fully
+# configured, so a single subsequent reload activates new protection without a
+# window where neither old nor new policies are defined in permanent config.
+# Historical names are YAML literals in this task (not Ansible variables), so
+# config.yml / inventory / role params / extra-vars cannot widen the delete set.
+# Current configured names are skipped so an intentional reuse of a former
+# default as the active policy name is not deleted during migration.
+- name: Remove known legacy project firewalld policies after current policies are configured
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - --delete-policy
+      - "{{ item }}"
+  loop:
+    - airvpn-host-to-vpn
+    - airvpn-host-to-underlay
+  when:
+    - item != airvpn_policy_to_vpn
+    - item != airvpn_policy_to_underlay
+  register: airvpn_legacy_pol_delete
+  changed_when: airvpn_legacy_pol_delete.rc == 0
+  # Already-absent legacy policies are idempotent success (NOT_ENABLED /
+  # INVALID_POLICY). Unexpected failures remain fatal.
+  failed_when: >-
+    airvpn_legacy_pol_delete.rc != 0
+    and ('NOT_ENABLED' not in (airvpn_legacy_pol_delete.stdout | default(''))
+         and 'NOT_ENABLED' not in (airvpn_legacy_pol_delete.stderr | default(''))
+         and 'INVALID_POLICY' not in (airvpn_legacy_pol_delete.stdout | default(''))
+         and 'INVALID_POLICY' not in (airvpn_legacy_pol_delete.stderr | default('')))
+
+- name: Validate permanent firewalld configuration before reload
+  ansible.builtin.command:
+    cmd: firewall-cmd --check-config
+  changed_when: false
+
+- name: Reload firewalld to activate permanent zones and policies
+  ansible.builtin.command:
+    cmd: firewall-cmd --reload
+  register: airvpn_fw_reload
+  changed_when: airvpn_fw_reload.rc == 0
+  when: >-
+    (airvpn_zone_airvpn is changed) or
+    (airvpn_zone_underlay is changed) or
+    (airvpn_pol_vpn_create is changed) or
+    (airvpn_pol_underlay_create is changed) or
+    (airvpn_pol_vpn_ingress is changed) or
+    (airvpn_pol_vpn_egress is changed) or
+    (airvpn_pol_vpn_set_target is changed) or
+    (airvpn_pol_underlay_ingress is changed) or
+    (airvpn_pol_underlay_egress is changed) or
+    (airvpn_pol_underlay_set_target is changed) or
+    (airvpn_legacy_pol_delete is changed)
+
+- name: Synchronize WireGuard endpoint exceptions
+  ansible.builtin.command:
+    cmd: "{{ airvpn_bin_dir }}/airvpn-firewall-sync"
+  register: airvpn_fw_sync
+  changed_when: >-
+    ('Adding endpoint exception' in (airvpn_fw_sync.stderr | default('')))
+    or ('Removing obsolete project-owned endpoint rule' in (airvpn_fw_sync.stderr | default('')))
+    or ('Adding baseline underlay allowance' in (airvpn_fw_sync.stderr | default('')))
+    or ('firewalld reloaded' in (airvpn_fw_sync.stderr | default('')))

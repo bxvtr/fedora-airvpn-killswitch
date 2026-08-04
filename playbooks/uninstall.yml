@@ -1,0 +1,241 @@
+---
+- name: Uninstall AirVPN client managed state
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../example.config.yml"
+  vars:
+    airvpn_uninstall_confirmed: false
+  tasks:
+    - name: Load airvpn_client role defaults
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../roles/airvpn_client/defaults/main.yml"
+
+    - name: Stat local config.yml
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../config.yml"
+      register: airvpn_local_config
+
+    - name: Load local config.yml overrides when present
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../config.yml"
+      when: airvpn_local_config.stat.exists
+
+    - name: Require explicit uninstall confirmation
+      ansible.builtin.assert:
+        that:
+          - airvpn_uninstall_confirmed | bool
+        fail_msg: >-
+          Refusing to uninstall. Re-run with -e airvpn_uninstall_confirmed=true.
+          WARNING: Removing the kill switch can restore direct Internet access
+          on physical interfaces.
+
+    - name: Warn about restoring direct Internet access
+      ansible.builtin.debug:
+        msg: >-
+          WARNING: Uninstall removes project kill-switch policies/zones and can
+          restore direct Internet access on physical NetworkManager profiles.
+
+    - name: Disconnect managed AirVPN profiles
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            # Source the role copy from this repository, not the installed
+            # libexec tree. The first uninstall removes installed runtime files;
+            # a second uninstall must still be able to parse nmcli output.
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
+            prefix={{ airvpn_connection_prefix | to_json }}
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              name="${AIRVPN_NM_FIELDS[1]-}"
+              state="${AIRVPN_NM_FIELDS[2]-}"
+              [[ -n "${uuid}" ]] || continue
+              [[ "${name}" == "${prefix}"* ]] || continue
+              [[ "${state}" == "activated" || "${state}" == "activating" ]] || continue
+              nmcli connection down uuid "${uuid}" || true
+            done < <(nmcli -t -f UUID,NAME,STATE connection show 2>/dev/null || true)
+      register: airvpn_disconnect
+      changed_when: true
+      # Templating of ${#...} is avoided by using ${VAR-} defaults instead of length checks.
+
+    - name: Remove managed AirVPN NetworkManager profiles
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
+            prefix={{ airvpn_connection_prefix | to_json }}
+            changed=0
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              name="${AIRVPN_NM_FIELDS[1]-}"
+              [[ -n "${uuid}" ]] || continue
+              [[ "${name}" == "${prefix}"* ]] || continue
+              nmcli connection delete uuid "${uuid}"
+              changed=1
+            done < <(nmcli -t -f UUID,NAME connection show 2>/dev/null || true)
+            exit "${changed}"
+      register: airvpn_rm_profiles
+      changed_when: airvpn_rm_profiles.rc == 1
+      failed_when: airvpn_rm_profiles.rc > 1
+      when: airvpn_uninstall_remove_profiles | bool
+
+    - name: Restore physical profiles to restore zone
+      ansible.builtin.command:
+        argv:
+          - bash
+          - -c
+          - |
+            set -Eeuo pipefail
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
+            underlay={{ airvpn_underlay_zone | to_json }}
+            restore={{ airvpn_restore_zone | to_json }}
+            changed=0
+            while IFS= read -r line; do
+              [[ -n "${line}" ]] || continue
+              airvpn_nmcli_split_terse "${line}"
+              uuid="${AIRVPN_NM_FIELDS[0]-}"
+              ctype="${AIRVPN_NM_FIELDS[2]-}"
+              [[ -n "${uuid}" ]] || continue
+              case "${ctype}" in
+                802-11-wireless|802-3-ethernet) ;;
+                *) continue ;;
+              esac
+              zone="$(nmcli -g connection.zone connection show "${uuid}" || true)"
+              if [[ "${zone}" == "${underlay}" ]]; then
+                nmcli connection modify uuid "${uuid}" connection.zone "${restore}"
+                changed=1
+              fi
+            done < <(nmcli -t -f UUID,NAME,TYPE connection show 2>/dev/null || true)
+            exit "${changed}"
+      register: airvpn_restore_zones
+      changed_when: airvpn_restore_zones.rc == 1
+      failed_when: airvpn_restore_zones.rc > 1
+
+    # Exact union of current configured policy names plus two historical
+    # project defaults. Historical names are YAML/Jinja string literals here
+    # (not Ansible variables), so config.yml / inventory / extra-vars cannot
+    # widen the delete set. Only airvpn_policy_to_* remain operator-configurable.
+    - name: Remove project firewalld policies if present
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --delete-policy
+          - "{{ item }}"
+      loop: >-
+        {{
+          [
+            airvpn_policy_to_vpn,
+            airvpn_policy_to_underlay,
+            'airvpn-host-to-vpn',
+            'airvpn-host-to-underlay'
+          ]
+          | reject('equalto', '')
+          | unique
+          | list
+          | sort
+        }}
+      register: airvpn_del_policy
+      changed_when: airvpn_del_policy.rc == 0
+      # Already-absent policies are idempotent success. firewalld may report
+      # NOT_ENABLED and/or INVALID_POLICY depending on version; treat both as OK.
+      # Unexpected failures (permissions, dbus, syntax) remain fatal.
+      failed_when: >-
+        airvpn_del_policy.rc != 0
+        and ('NOT_ENABLED' not in (airvpn_del_policy.stdout | default(''))
+             and 'NOT_ENABLED' not in (airvpn_del_policy.stderr | default(''))
+             and 'INVALID_POLICY' not in (airvpn_del_policy.stdout | default(''))
+             and 'INVALID_POLICY' not in (airvpn_del_policy.stderr | default('')))
+
+    # Zone delete transactions must be permanent-only (no immediate=true).
+    - name: Remove project firewalld zones if present
+      ansible.posix.firewalld:
+        zone: "{{ item }}"
+        state: absent
+        permanent: true
+      loop:
+        - "{{ airvpn_zone }}"
+        - "{{ airvpn_underlay_zone }}"
+
+    - name: Validate firewalld configuration after removals
+      ansible.builtin.command:
+        cmd: firewall-cmd --check-config
+      changed_when: false
+
+    - name: Reload firewalld after uninstall changes
+      ansible.builtin.command:
+        cmd: firewall-cmd --reload
+      changed_when: true
+
+    # Fail closed if any exact cleanup candidate remains after reload.
+    - name: Verify project firewalld policies are absent after uninstall
+      ansible.builtin.command:
+        argv:
+          - firewall-cmd
+          - --permanent
+          - --info-policy
+          - "{{ item }}"
+      loop: >-
+        {{
+          [
+            airvpn_policy_to_vpn,
+            airvpn_policy_to_underlay,
+            'airvpn-host-to-vpn',
+            'airvpn-host-to-underlay'
+          ]
+          | reject('equalto', '')
+          | unique
+          | list
+          | sort
+        }}
+      register: airvpn_pol_absent_check
+      changed_when: false
+      failed_when: airvpn_pol_absent_check.rc == 0
+
+    - name: Remove installed runtime scripts and wrappers
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop: >-
+        {{
+          (airvpn_runtime_scripts | map('regex_replace', '^(.*)$', airvpn_bin_dir ~ '/\1') | list)
+          + (airvpn_runtime_scripts | map('regex_replace', '^(.*)$', airvpn_install_dir ~ '/\1') | list)
+          + [
+              airvpn_install_dir ~ '/lib/airvpn-common.sh',
+              airvpn_install_dir ~ '/lib/airvpn-select-physical-uuids.sh',
+              airvpn_config_dir ~ '/airvpn-client.conf'
+            ]
+        }}
+
+    - name: Remove install and state directories
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - "{{ airvpn_install_dir }}"
+        - "{{ airvpn_state_dir }}"
+
+    - name: Optionally delete managed AirVPN configuration copies
+      ansible.builtin.file:
+        path: "{{ airvpn_managed_config_dir }}"
+        state: absent
+      when: airvpn_uninstall_delete_configs | bool
+
+    - name: Leave managed configs in place when deletion not requested
+      ansible.builtin.debug:
+        msg: >-
+          Preserved {{ airvpn_managed_config_dir }} (contains private keys).
+          Delete manually or re-run with -e airvpn_uninstall_delete_configs=true.
+      when: not (airvpn_uninstall_delete_configs | bool)

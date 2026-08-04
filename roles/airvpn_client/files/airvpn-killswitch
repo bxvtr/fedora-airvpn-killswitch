@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Enable, disable, or show project-managed kill-switch firewall policies.
+set -Eeuo pipefail
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+# shellcheck source=lib/airvpn-common.sh
+source "${SCRIPT_DIR}/lib/airvpn-common.sh"
+
+usage() {
+  cat <<'EOF'
+Usage: airvpn-killswitch status|enable|disable [--force]
+
+Manage only project-owned firewalld policies. This never disables firewalld
+globally.
+
+  status   Show policy targets
+  enable   Set underlay policy to REJECT and VPN policy to ACCEPT
+  disable  Set underlay policy to ACCEPT (DANGEROUS: may allow direct leaks)
+           Requires interactive confirmation unless --force is supplied
+EOF
+}
+
+CMD="${1:-}"
+FORCE=0
+shift || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --force)
+      FORCE=1
+      shift
+      ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *) airvpn_die "Unknown argument: $1" ;;
+  esac
+done
+
+[[ -n "${CMD}" ]] || {
+  usage
+  exit 2
+}
+
+airvpn_load_config
+airvpn_require_root
+airvpn_require_cmds firewall-cmd flock
+
+show_status() {
+  local p target
+  for p in "${AIRVPN_POLICY_TO_VPN}" "${AIRVPN_POLICY_TO_UNDERLAY}"; do
+    if firewall-cmd --info-policy "${p}" >/dev/null 2>&1; then
+      target="$(firewall-cmd --policy "${p}" --get-target 2>/dev/null || echo unknown)"
+      echo "${p}: target=${target}"
+    else
+      echo "${p}: MISSING"
+    fi
+  done
+}
+
+enable_ks() {
+  firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_VPN}" --set-target=ACCEPT
+  firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --set-target=REJECT
+  airvpn_firewall_check_config
+  firewall-cmd --reload >/dev/null
+  airvpn_log "INFO" "Kill switch enabled (underlay REJECT, vpn ACCEPT)"
+}
+
+disable_ks() {
+  cat <<'WARN' >&2
+WARNING: Disabling the project kill switch allows direct Internet traffic on
+managed underlay interfaces. Traffic may leak outside the VPN tunnel.
+This does NOT stop firewalld itself; only project policy targets are changed.
+WARN
+  if ((FORCE == 0)); then
+    local answer
+    read -r -p "Type 'DISABLE KILLSWITCH' to confirm: " answer
+    if [[ "${answer}" != "DISABLE KILLSWITCH" ]]; then
+      airvpn_die "Aborted; kill switch unchanged"
+    fi
+  fi
+  firewall-cmd --permanent --policy "${AIRVPN_POLICY_TO_UNDERLAY}" --set-target=ACCEPT
+  airvpn_firewall_check_config
+  firewall-cmd --reload >/dev/null
+  airvpn_log "WARN" "Kill switch disabled for underlay policy; direct traffic may leak"
+}
+
+case "${CMD}" in
+  status)
+    show_status
+    ;;
+  enable)
+    airvpn_with_lock killswitch enable_ks
+    ;;
+  disable)
+    airvpn_with_lock killswitch disable_ks
+    ;;
+  *)
+    usage
+    exit 2
+    ;;
+esac

@@ -1,0 +1,18 @@
+# Managed by the airvpn_client Ansible role. Do not edit by hand unless you
+# know the implications for the kill switch and runtime commands.
+# shellcheck shell=bash
+
+AIRVPN_CONFIG_DIR="{{ airvpn_config_dir }}"
+AIRVPN_MANAGED_CONFIG_DIR="{{ airvpn_managed_config_dir }}"
+AIRVPN_INSTALL_DIR="{{ airvpn_install_dir }}"
+AIRVPN_BIN_DIR="{{ airvpn_bin_dir }}"
+AIRVPN_CONNECTION_PREFIX="{{ airvpn_connection_prefix }}"
+AIRVPN_ZONE="{{ airvpn_zone }}"
+AIRVPN_UNDERLAY_ZONE="{{ airvpn_underlay_zone }}"
+AIRVPN_POLICY_TO_VPN="{{ airvpn_policy_to_vpn }}"
+AIRVPN_POLICY_TO_UNDERLAY="{{ airvpn_policy_to_underlay }}"
+AIRVPN_DNS_PRIORITY="{{ airvpn_dns_priority }}"
+AIRVPN_ENABLE_IPV6="{{ airvpn_enable_ipv6 | lower }}"
+AIRVPN_RESTORE_ZONE="{{ airvpn_restore_zone }}"
+AIRVPN_STATE_DIR="{{ airvpn_state_dir }}"
+AIRVPN_LOCK_FILE="/run/airvpn-client.lock"

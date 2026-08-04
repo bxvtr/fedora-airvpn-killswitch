@@ -1,0 +1,16 @@
+---
+# Exact Ansible collection pins for reproducible installs.
+# Update process: see CONTRIBUTING.md ("Dependency updates").
+#
+# Verified against Ansible Galaxy on 2026-08-02:
+# - ansible.posix 2.2.2 (requires_ansible >= 2.16.0); provides firewalld zone helpers
+# - community.general 13.2.0; provides nmcli and miscellaneous helpers
+#
+# Note: firewalld *policy objects* are managed via firewall-cmd in project
+# scripts because ansible.posix 2.2.2 has no dedicated policy module.
+
+collections:
+  - name: ansible.posix
+    version: 2.2.2
+  - name: community.general
+    version: 13.2.0

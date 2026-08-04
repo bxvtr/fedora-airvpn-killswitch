@@ -1,0 +1,121 @@
+---
+- name: Select physical connection UUIDs for underlay protection
+  ansible.builtin.command:
+    argv: "{{ [airvpn_install_dir ~ '/lib/airvpn-select-physical-uuids.sh'] + airvpn_physical_select_args }}"
+  vars:
+    airvpn_physical_select_args: >-
+      {{
+        (['--wifi'] if airvpn_manage_wifi_connections else [])
+        + (['--ethernet'] if airvpn_manage_ethernet_connections else [])
+        + (airvpn_physical_exclude | map('regex_replace', '^(.*)$', '--exclude=\1') | list)
+        + (airvpn_physical_include | map('regex_replace', '^(.*)$', '--include=\1') | list)
+      }}
+  register: airvpn_physical_uuid_lines
+  changed_when: false
+
+# Helper prints one nmcli UUID per line. Trim blanks, drop empty lines, then
+# order-preserving unique. Do not pass the length filter name to select/reject:
+# length is a filter, not a Jinja test (ansible-core 2.21: "No test named ...").
+- name: Set physical UUID fact
+  ansible.builtin.set_fact:
+    airvpn_physical_uuids: >-
+      {{
+        airvpn_physical_uuid_lines.stdout_lines
+        | map('trim')
+        | reject('equalto', '')
+        | unique
+        | list
+      }}
+
+- name: Query current zone for each physical connection
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - -g
+      - connection.zone
+      - connection
+      - show
+      - "{{ item }}"
+  register: airvpn_physical_zones
+  changed_when: false
+  loop: "{{ airvpn_physical_uuids }}"
+  loop_control:
+    label: "{{ item }}"
+  when: airvpn_physical_uuids | length > 0
+
+- name: Assign physical NetworkManager profiles to underlay zone
+  ansible.builtin.command:
+    argv:
+      - nmcli
+      - connection
+      - modify
+      - uuid
+      - "{{ item.item }}"
+      - connection.zone
+      - "{{ airvpn_underlay_zone }}"
+  loop: "{{ airvpn_physical_zones.results | default([]) }}"
+  loop_control:
+    label: "{{ item.item }}"
+  when:
+    - airvpn_physical_uuids | length > 0
+    - (item.stdout | default('') | trim) != airvpn_underlay_zone
+  changed_when: true
+
+# nmcli connection.zone updates profile metadata only. Active interfaces may keep
+# a previous firewalld runtime zone until reapply. Always verify runtime binding
+# for managed physical UUIDs and fail closed if an active interface cannot bind.
+# Collect every iteration first so a later success cannot hide an earlier failure;
+# then assert over results (do not treat the loop register aggregate .rc as current).
+- name: Reapply underlay zone on active physical interfaces
+  ansible.builtin.shell: |
+    set -Eeuo pipefail
+    # shellcheck disable=SC1091
+    source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+    airvpn_ensure_runtime_zone "{{ item }}" "{{ airvpn_underlay_zone }}"
+  args:
+    executable: /bin/bash
+  loop: "{{ airvpn_physical_uuids }}"
+  loop_control:
+    label: "{{ item }}"
+  when: airvpn_physical_uuids | length > 0
+  register: airvpn_runtime_zone
+  changed_when: >-
+    'applied ' in (airvpn_runtime_zone.stdout | default(''))
+  failed_when: false
+
+- name: Fail closed if any underlay runtime zone reapply failed
+  ansible.builtin.assert:
+    that:
+      - airvpn_failed_runtime_zone_uuids | length == 0
+    fail_msg: >-
+      Underlay runtime zone binding failed for connection UUID(s):
+      {{ airvpn_failed_runtime_zone_uuids | join(', ') }}
+  vars:
+    airvpn_failed_runtime_zone_uuids: >-
+      {{
+        airvpn_runtime_zone.results
+        | default([])
+        | selectattr('rc', 'defined')
+        | selectattr('rc', 'ne', 0)
+        | map(attribute='item')
+        | list
+      }}
+  when:
+    - airvpn_physical_uuids | length > 0
+    - airvpn_runtime_zone is defined
+    - airvpn_runtime_zone.results is defined
+
+- name: Import AirVPN WireGuard profiles via airvpn-import
+  ansible.builtin.command:
+    argv:
+      - "{{ airvpn_bin_dir }}/airvpn-import"
+      - --source
+      - "{{ airvpn_config_source }}"
+      - --mode
+      - "{{ airvpn_replace_existing_profiles | ternary('replace', 'add') }}"
+  register: airvpn_import_result
+  changed_when: >-
+    ('Imported' in (airvpn_import_result.stderr | default('')))
+    or ('Imported' in (airvpn_import_result.stdout | default('')))
+    or ('Removing managed profile' in (airvpn_import_result.stderr | default('')))
+    or ('refreshed managed config copy' in (airvpn_import_result.stderr | default('')))

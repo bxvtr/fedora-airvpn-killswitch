@@ -1,0 +1,72 @@
+# Local configuration (may contain paths and host-specific settings)
+/config.yml
+/config.yaml
+
+# Local Python virtual environment used by bootstrap
+/.venv/
+/venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Ansible runtime artifacts
+/.ansible/
+/collections/
+*.retry
+ansible.log
+
+# Editor / OS
+*~
+*.swp
+*.swo
+.DS_Store
+.idea/
+.vscode/
+*.code-workspace
+
+# Secrets and AirVPN WireGuard configurations
+# WARNING: AirVPN .conf files contain WireGuard private keys. Never commit them.
+# Ignore WireGuard-style secrets by default; keep explicit test fixtures.
+*.conf
+!example*.conf
+!tests/fixtures/*.conf
+!roles/airvpn_client/templates/*.j2
+
+# Explicitly ignore common secret locations
+/airvpn-configs/
+/configs/
+/private/
+/**/privatekey*
+/**/PrivateKey*
+*.pem
+*.key
+!*.key.example
+.env
+.env.*
+!.env.example
+*.vault
+*.vault.yml
+vault_pass*
+.vault_pass*
+
+# Diagnostic dumps that may contain sensitive values
+/diagnostics/
+*.pcap
+*.log
+!CHANGELOG.md
+
+# Pre-commit / tooling caches
+.cache/
+.pre-commit-cache/
+.shellcheck-cache/
+
+# Test temporary output
+/tests/tmp/
+/tests/integration/artifacts/
+/tmp/

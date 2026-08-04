@@ -1,0 +1,98 @@
+---
+name: Lint
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  yamllint:
+    name: YAML lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install yamllint
+        run: pip install "yamllint==1.38.0"
+      - name: Run yamllint
+        run: yamllint -c .yamllint .
+
+  ansible-lint:
+    name: Ansible lint
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install controller requirements
+        run: pip install -r requirements-controller.txt
+      - name: Install collections
+        run: ansible-galaxy collection install -r requirements.yml -p .ansible/collections
+      - name: Run ansible-lint
+        run: ansible-lint
+
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install ShellCheck
+        run: sudo apt-get update && sudo apt-get install -y shellcheck
+      - name: Run ShellCheck
+        run: |
+          set -Eeuo pipefail
+          mapfile -t files < <(
+            find bootstrap.sh roles/airvpn_client/files tests/unit \
+              tests/integration/lib tools \
+              -type f \( \
+                -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \
+                -o -name 'validate-safe' -o -name 'check-agent-safety' \
+                -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \
+              \) | sort
+          )
+          shellcheck -x -S error "${files[@]}"
+          # Guard: no workflow step may execute the live integration runner.
+          if grep -R -n -E \
+            '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+            .github/workflows 2>/dev/null; then
+            echo "ERROR: live tools/integration-test-vm must not be executed from CI workflows" >&2
+            exit 1
+          fi
+          if grep -E -q \
+            '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' \
+            tools/validate-safe; then
+            echo "ERROR: tools/validate-safe must not execute tools/integration-test-vm" >&2
+            exit 1
+          fi
+          if grep -R -n -E \
+            '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+            .github/workflows 2>/dev/null; then
+            echo "ERROR: tools/uninstall-audit-snapshot must not be executed from CI workflows" >&2
+            exit 1
+          fi
+          if grep -E -q \
+            '^[[:space:]]*(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+            tools/validate-safe; then
+            echo "ERROR: tools/validate-safe must not execute tools/uninstall-audit-snapshot" >&2
+            exit 1
+          fi
+
+  unit-tests:
+    name: Unit tests
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run unit tests
+        run: bash tests/unit/run_all.sh

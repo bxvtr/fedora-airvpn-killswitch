@@ -1,0 +1,23 @@
+---
+- name: Install required host packages on package-based Fedora
+  ansible.builtin.package:
+    name: "{{ airvpn_host_packages }}"
+    state: present
+
+- name: Re-probe required host commands after package install
+  ansible.builtin.command:
+    cmd: bash -c 'command -v {{ item.command }}'
+  register: airvpn_cmd_probe_after
+  changed_when: false
+  loop: "{{ airvpn_host_dependencies }}"
+  loop_control:
+    label: "{{ item.command }}"
+
+- name: Assert all required commands are present on package-based Fedora
+  ansible.builtin.assert:
+    that:
+      - item.rc == 0
+    fail_msg: "Required command '{{ item.item.command }}' is still missing after package installation."
+  loop: "{{ airvpn_cmd_probe_after.results }}"
+  loop_control:
+    label: "{{ item.item.command }}"

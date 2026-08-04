@@ -1,0 +1,22 @@
+---
+- name: Install AirVPN NetworkManager client with firewalld kill switch
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: true
+  vars_files:
+    - "{{ playbook_dir }}/../example.config.yml"
+  tasks:
+    - name: Stat local config.yml
+      ansible.builtin.stat:
+        path: "{{ playbook_dir }}/../config.yml"
+      register: airvpn_local_config
+
+    - name: Load local config.yml overrides when present
+      ansible.builtin.include_vars:
+        file: "{{ playbook_dir }}/../config.yml"
+      when: airvpn_local_config.stat.exists
+
+    - name: Import airvpn_client role
+      ansible.builtin.import_role:
+        name: airvpn_client

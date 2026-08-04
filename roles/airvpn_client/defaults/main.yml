@@ -1,0 +1,72 @@
+---
+# Default variables for the airvpn_client role.
+# Override via config.yml / extra-vars. Do not put secrets here.
+
+airvpn_config_source: ""
+airvpn_connection_prefix: "AirVPN - "
+airvpn_managed_config_dir: "/etc/airvpn-client/configs"
+airvpn_config_dir: "/etc/airvpn-client"
+airvpn_install_dir: "/usr/local/libexec/airvpn-client"
+airvpn_bin_dir: "/usr/local/bin"
+airvpn_state_dir: "/var/lib/airvpn-client"
+
+airvpn_zone: "airvpn"
+airvpn_underlay_zone: "vpn-underlay"
+# firewalld policy names are limited by iptables chain length (currently 18 on
+# supported Fedora/firewalld). Keep defaults short and validate overrides early.
+airvpn_firewalld_policy_name_max: 18
+airvpn_firewalld_zone_name_max: 17
+airvpn_policy_to_vpn: "airvpn-host-vpn"
+airvpn_policy_to_underlay: "airvpn-host-under"
+airvpn_dns_priority: -100
+
+airvpn_manage_wifi_connections: true
+airvpn_manage_ethernet_connections: true
+airvpn_physical_include: []
+airvpn_physical_exclude: []
+
+airvpn_enable_ipv6: true
+airvpn_replace_existing_profiles: false
+airvpn_restore_zone: "public"
+airvpn_atomic_layer_missing_packages: false
+
+airvpn_uninstall_remove_profiles: true
+airvpn_uninstall_delete_configs: false
+
+# Map required host commands to Fedora package names (package-based Fedora).
+airvpn_host_dependencies:
+  - command: nmcli
+    package: NetworkManager
+  - command: firewall-cmd
+    package: firewalld
+  - command: wg
+    package: wireguard-tools
+  - command: python3
+    package: python3
+  - command: systemctl
+    package: systemd
+
+# Packages required beyond command presence checks.
+airvpn_host_packages:
+  - NetworkManager
+  - firewalld
+  - wireguard-tools
+  - python3
+  - python3-firewall
+
+airvpn_required_services:
+  - NetworkManager
+  - firewalld
+
+# Runtime scripts installed from role files/
+airvpn_runtime_scripts:
+  - airvpn-import
+  - airvpn-switch
+  - airvpn-firewall-sync
+  - airvpn-protect-connection
+  - airvpn-status
+  - airvpn-check
+  - airvpn-killswitch
+
+airvpn_supported_os_families:
+  - RedHat

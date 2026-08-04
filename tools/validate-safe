@@ -1,0 +1,226 @@
+#!/usr/bin/env bash
+# Static validation wrapper for safe local / agent use.
+# Does not mutate host networking, packages, or Git state.
+set -Eeuo pipefail
+
+PASS_N=0
+FAIL_N=0
+SKIP_N=0
+
+pass() {
+  printf 'PASS: %s\n' "$1"
+  PASS_N=$((PASS_N + 1))
+}
+
+fail() {
+  printf 'FAIL: %s\n' "$1"
+  FAIL_N=$((FAIL_N + 1))
+}
+
+skip() {
+  printf 'SKIP: %s\n' "$1"
+  SKIP_N=$((SKIP_N + 1))
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+if [[ "${EUID}" -eq 0 ]]; then
+  die "Refusing to run as root"
+fi
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+[[ -n "${ROOT}" && -d "${ROOT}/.git" && -f "${ROOT}/README.md" ]] || die "Could not establish repository root"
+cd "${ROOT}"
+
+have_cmd() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+printf '=== tools/validate-safe ===\n'
+printf 'Repository: %s\n' "${ROOT}"
+printf 'Note: pre-commit is omitted here because hooks may download environments,\n'
+printf '      install additional packages, and shfmt is configured with -w (writes).\n'
+printf '      Prefer explicit static tools below.\n\n'
+
+# 1) Bash syntax for known tracked shell entry points (explicit globs; no arbitrary executables)
+mapfile -d '' -t bash_targets < <(
+  find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools \
+    -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \) \
+    -print0 | sort -z
+)
+
+if ((${#bash_targets[@]} == 0)); then
+  fail "bash -n (no scripts found)"
+else
+  bn_ok=1
+  for f in "${bash_targets[@]}"; do
+    if ! bash -n "${f}"; then
+      bn_ok=0
+      fail "bash -n ${f#"${ROOT}"/}"
+    fi
+  done
+  if ((bn_ok == 1)); then
+    pass "bash -n (${#bash_targets[@]} scripts)"
+  fi
+fi
+
+# 2) ShellCheck
+if have_cmd shellcheck; then
+  if shellcheck -x -S error "${bash_targets[@]}"; then
+    pass "shellcheck"
+  else
+    fail "shellcheck"
+  fi
+else
+  skip "shellcheck (not installed)"
+fi
+
+# 3) shfmt check mode only (never -w)
+if have_cmd shfmt; then
+  if shfmt -d -i 2 -ci "${bash_targets[@]}"; then
+    pass "shfmt -d"
+  else
+    fail "shfmt -d (formatting drift)"
+  fi
+else
+  skip "shfmt (not installed)"
+fi
+
+# 4) yamllint
+if have_cmd yamllint; then
+  if yamllint -c .yamllint .; then
+    pass "yamllint"
+  else
+    fail "yamllint"
+  fi
+else
+  skip "yamllint (not installed)"
+fi
+
+# 5) ansible-lint
+if have_cmd ansible-lint; then
+  if ansible-lint; then
+    pass "ansible-lint"
+  else
+    fail "ansible-lint"
+  fi
+else
+  skip "ansible-lint (not installed)"
+fi
+
+# 6) Ansible syntax-check only
+if have_cmd ansible-playbook; then
+  syn_ok=1
+  for pb in playbooks/install.yml playbooks/verify.yml playbooks/uninstall.yml; do
+    if ! ansible-playbook --syntax-check -i inventory/localhost.yml "${pb}" \
+      -e airvpn_config_source=/tmp/airvpn-dummy-configs \
+      -e airvpn_uninstall_confirmed=true >/dev/null; then
+      syn_ok=0
+      fail "ansible-playbook --syntax-check ${pb}"
+    fi
+  done
+  if ((syn_ok == 1)); then
+    pass "ansible-playbook --syntax-check (install/verify/uninstall)"
+  fi
+else
+  skip "ansible-playbook (not installed)"
+fi
+
+# 7) Explicit unit-test entry point only
+if [[ -x tests/unit/run_all.sh ]]; then
+  if bash tests/unit/run_all.sh; then
+    pass "tests/unit/run_all.sh"
+  else
+    fail "tests/unit/run_all.sh"
+  fi
+else
+  fail "tests/unit/run_all.sh missing or not executable"
+fi
+
+# 8) pre-commit omitted (documented above)
+skip "pre-commit (omitted: may download hook envs / write via shfmt -w)"
+
+# 9) Gitleaks (redacted); do not print secret values
+if have_cmd gitleaks; then
+  if gitleaks detect --source . --config .gitleaks.toml --redact --no-banner; then
+    pass "gitleaks"
+  else
+    fail "gitleaks (see report filenames only; values redacted)"
+  fi
+else
+  skip "gitleaks (not installed on PATH; CI/pre-commit may still cover it)"
+fi
+
+# 10) git diff --check
+if git diff --check && git diff --cached --check; then
+  pass "git diff --check"
+else
+  fail "git diff --check"
+fi
+
+# 11) Forbidden tracked secret-like paths
+forbidden_tracked=0
+while IFS= read -r path; do
+  [[ -z "${path}" ]] && continue
+  case "${path}" in
+    tests/fixtures/*) continue ;;
+    *.key | *.pem | *.p12 | *.pfx | .env | .env.* | */.env | */.env.*)
+      printf 'FAIL: forbidden tracked path: %s\n' "${path}"
+      forbidden_tracked=1
+      ;;
+    config.yml)
+      printf 'FAIL: forbidden tracked path: %s\n' "${path}"
+      forbidden_tracked=1
+      ;;
+  esac
+done < <(git ls-files)
+if ((forbidden_tracked == 0)); then
+  pass "no forbidden tracked secret-like paths"
+else
+  fail "forbidden tracked secret-like paths present"
+fi
+
+# 12) No AirVPN .conf tracked outside fake fixtures
+conf_bad=0
+while IFS= read -r path; do
+  [[ -z "${path}" ]] && continue
+  case "${path}" in
+    tests/fixtures/*.conf) continue ;;
+    *.conf)
+      printf 'FAIL: tracked WireGuard/AirVPN conf outside fixtures: %s\n' "${path}"
+      conf_bad=1
+      ;;
+  esac
+done < <(git ls-files '*.conf')
+if ((conf_bad == 0)); then
+  pass "no tracked AirVPN .conf outside tests/fixtures"
+else
+  fail "tracked AirVPN .conf outside tests/fixtures"
+fi
+
+# 13) Live integration runner must never be invoked from this static wrapper
+if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' "${SCRIPT_PATH}"; then
+  fail "validate-safe must not invoke tools/integration-test-vm"
+else
+  pass "validate-safe does not invoke tools/integration-test-vm"
+fi
+if [[ -x tools/integration-test-vm ]]; then
+  pass "tools/integration-test-vm present (opt-in only; not executed here)"
+else
+  fail "tools/integration-test-vm missing or not executable"
+fi
+
+printf '\n=== summary ===\n'
+printf 'PASS: %s\n' "${PASS_N}"
+printf 'FAIL: %s\n' "${FAIL_N}"
+printf 'SKIP: %s\n' "${SKIP_N}"
+
+if ((FAIL_N > 0)); then
+  exit 1
+fi
+exit 0

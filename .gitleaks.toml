@@ -1,0 +1,28 @@
+title = "fedora-airvpn-killswitch gitleaks config"
+
+[extend]
+# Use default gitleaks rules and extend with project-specific allowlists.
+
+[[allowlists]]
+description = "Allow documented fake WireGuard placeholders in fixtures and examples"
+paths = [
+  '''tests/fixtures/.*''',
+  '''example\.config\.yml''',
+  '''.*\.md''',
+]
+
+[[rules]]
+id = "wireguard-private-key-assignment"
+description = "WireGuard PrivateKey assignment (potential secret)"
+regex = '''(?i)PrivateKey\s*=\s*[A-Za-z0-9+/]{42,44}={0,2}'''
+keywords = ["PrivateKey"]
+
+[[allowlists]]
+description = "Allow obvious fake placeholder PrivateKey lines in fixtures"
+regexes = [
+  '''PrivateKey = A{20,}''',
+  '''PrivateKey = C{20,}''',
+  '''PrivateKey = AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAEE=''',
+  '''PrivateKey = CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCEE=''',
+]
+paths = ['''tests/fixtures/.*''']

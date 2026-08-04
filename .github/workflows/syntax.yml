@@ -1,0 +1,56 @@
+---
+name: Syntax
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  ansible-syntax:
+    name: Ansible syntax check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install controller requirements and collections
+        run: |
+          pip install -r requirements-controller.txt
+          ansible-galaxy collection install -r requirements.yml -p .ansible/collections
+      - name: Syntax-check playbooks
+        run: |
+          set -Eeuo pipefail
+          # Provide a dummy config source path for parse-time vars; syntax check
+          # does not execute tasks that require the directory to exist.
+          for pb in playbooks/*.yml; do
+            ansible-playbook --syntax-check "$pb" \
+              -e airvpn_config_source=/tmp/airvpn-syntax-dummy \
+              -e airvpn_uninstall_confirmed=true
+          done
+
+  bash-syntax:
+    name: Bash syntax check
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: bash -n on scripts
+        run: |
+          set -Eeuo pipefail
+          bash -n bootstrap.sh
+          while IFS= read -r -d '' f; do
+            bash -n "$f"
+          done < <(
+            find roles/airvpn_client/files tests/unit tests/integration/lib tools \
+              -type f \( \
+                -name 'airvpn-*' -o -name '*.sh' \
+                -o -name 'validate-safe' -o -name 'check-agent-safety' \
+                -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \
+              \) -print0
+          )
