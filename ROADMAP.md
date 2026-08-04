@@ -1,24 +1,66 @@
 # Roadmap
 
-## Version 1 (current focus)
+This roadmap describes direction only. It has **no dates**, **no delivery
+promises**, and does **not** expand the current release into unproven claims.
+See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) for what is live
+validated versus only statically identified.
 
-- Direct Ansible execution on the managed Fedora host (controller == managed host).
-- Fedora Workstation, Spins, and Atomic Desktops with NetworkManager + firewalld.
-- AirVPN WireGuard import, profile hardening, firewalld policy kill switch, and runtime switching.
-- Opt-in disposable Fedora VM integration workflow (`tools/integration-test-vm`)
-  for full install/switch/fail-closed/uninstall lifecycle testing (manual only).
+## v0.1.x Hardening
 
-## Possible future work
+Focused on making the current direct-on-host Fedora kill-switch path safer and
+clearer without redesigning network lifecycle automation:
 
-These items are intentionally **not** implemented in version 1:
+- Make uninstall safely repeatable after a successful first run.
+- Add stronger post-uninstall verification (zones, profiles, paths, optional
+  machine-readable checks).
+- Improve handling of partial uninstall failures.
+- Improve the uninstall audit collector formatting and deterministic output.
+- Clarify retained managed configuration and restore-zone behavior in operator
+  messaging where helpful.
+- Consider explicit checks for pre-existing project object name conflicts
+  before mutating firewalld.
 
-- Remote Ansible controller over SSH
-- Additional Linux distributions (Debian, Ubuntu, Arch Linux, openSUSE, etc.)
-- Automated protection of newly created physical NetworkManager profiles via a dispatcher script
-- Broader automated integration testing beyond the opt-in disposable-VM runner
-  (`tools/integration-test-vm` is supported but never runs in GitHub-hosted CI)
-- Publishing as a package or Ansible Galaxy role
-- Graphical user interface
-- Optional mode that allows only the currently selected VPN endpoint (instead of all imported endpoints)
+## v0.2.0 Network Lifecycle
 
-Contributions that advance version-1 safety, clarity, and reproducibility are preferred over expanding scope early.
+Focused on physical connection lifecycle gaps that static review and daily
+Wi-Fi use make important:
+
+- Detect and protect physical connections created after installation.
+- Add NetworkManager lifecycle integration for new connections (for example a
+  carefully scoped dispatcher), without weakening fail-closed defaults.
+- Validate physical Wi-Fi hardware.
+- Validate SSID changes, roaming, reconnect, and suspend/resume.
+- Validate simultaneous Ethernet and Wi-Fi.
+- Restore exact pre-installation NetworkManager zone assignments where that is
+  safe and recorded.
+- Define safe behavior for dynamically appearing physical uplinks.
+
+## Future
+
+Items that may matter later but are not required to harden the current path:
+
+- Ownership tracking or safer restoration for pre-existing firewalld objects
+  that share project names.
+- Broader Fedora variant validation beyond the current Silverblue 43 VM
+  evidence.
+- Optional package and service state restoration (today these remain system
+  prerequisites).
+- Additional diagnostics and machine-readable uninstall verification.
+- More complex network scenarios such as tethering and captive portals.
+- Remote Ansible controller over SSH.
+- Packaging or Ansible Galaxy distribution.
+- Optional “current endpoint only” underlay exception mode.
+
+## Out of Scope for the Current Roadmap
+
+- Non-Fedora distributions as supported targets
+- Non-AirVPN providers or arbitrary VPN protocols
+- A graphical client
+- General-purpose firewall management unrelated to this project’s zones and
+  policies
+- Claiming guaranteed leak-proof behavior or a complete system rollback after
+  uninstall
+
+Contributions that improve safety, clarity, and reproducible validation of the
+current Fedora + NetworkManager + firewalld path are preferred over early scope
+expansion.

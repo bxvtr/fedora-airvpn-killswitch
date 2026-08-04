@@ -30,18 +30,35 @@ THE SOFTWARE IS PROVIDED **WITHOUT WARRANTY**. Users must verify behavior on the
 - Hostname-based WireGuard `Endpoint` values are **rejected** (they need pre-tunnel DNS).
 - All imported numeric endpoints are allowed persistently (not “current endpoint only”).
 - Local LAN access via the underlay is blocked by the default kill switch (fail closed).
-- Newly created Wi-Fi/Ethernet profiles are **not** auto-protected; use `airvpn-protect-connection`.
+- Newly created Wi-Fi/Ethernet profiles are **not** guaranteed to be auto-protected;
+  verify them and use `airvpn-protect-connection` when needed.
 - CI does **not** exercise real NetworkManager/firewalld/WireGuard integration.
+- See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) for live vs static
+  validation status and current workarounds.
 
 ## Supported systems
 
-**Officially supported in version 1**
+**Target platform family (version 1)**
 
 - Fedora Workstation
 - Fedora Spins using NetworkManager and firewalld
 - Fedora Atomic Desktops using NetworkManager and firewalld
 
 Other distributions are **not** supported. See [ROADMAP.md](ROADMAP.md).
+
+### Platform and validation status
+
+```text
+Target platform family: Fedora (NetworkManager + firewalld)
+Live validated environment: Fedora Silverblue 43 (Atomic Desktop) under
+KVM/Fedora Boxes with a virtual Ethernet interface
+```
+
+That live run does **not** mean every Fedora 43 edition or every network
+topology was validated. NetworkManager Wi-Fi connection profiles are supported
+by the implementation, but physical Wi-Fi hardware and Wi-Fi lifecycle
+scenarios have not yet been live validated. Details:
+[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 
 ## Fedora Atomic notes
 
@@ -319,10 +336,17 @@ Managed AirVPN profiles are configured with `connection.autoconnect no`. After r
 
 ## Adding a new Wi-Fi or Ethernet profile
 
+Physical connection profiles created **after** installation may not
+automatically join `vpn-underlay`. Check new Ethernet/Wi-Fi profiles and
+protect them explicitly:
+
 ```bash
 sudo airvpn-protect-connection "MyNewWiFi"
 sudo airvpn-check --offline
 ```
+
+See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) for Wi-Fi validation
+status and related gaps.
 
 ## Updating AirVPN configurations
 
@@ -346,8 +370,25 @@ TTY (the playbook uses `become`). Inventory defaults come from `ansible.cfg`.
 
 WARNING: Uninstalling removes project kill-switch policies/zones (including
 known former default policy names) and can restore direct Internet access.
-Managed config copies under `/etc/airvpn-client/configs` are preserved unless
-`-e airvpn_uninstall_delete_configs=true`.
+
+In a controlled Silverblue 43 VM lifecycle with snapshot comparison, project
+policies, zones, managed VPN profiles, runtime scripts/wrappers, and project
+state were removed and ordinary connectivity returned after reboot. That does
+**not** prove a full system rollback of every host property.
+
+Additional uninstall semantics:
+
+- Physical profiles currently in the underlay zone are moved to
+  `airvpn_restore_zone` (default `public`). That is a **configured target
+  zone**, not an exact restore of each profile’s pre-installation zone.
+- Managed config copies under `/etc/airvpn-client/configs` are preserved unless
+  `-e airvpn_uninstall_delete_configs=true` (those copies may contain private
+  keys).
+- Repository-local controller artifacts (`.venv`, `.ansible/collections`) are
+  not removed by host uninstall.
+
+Details and workarounds:
+[docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md).
 
 ## Troubleshooting
 
@@ -384,6 +425,12 @@ validate NetworkManager/WireGuard/firewalld traffic. See
 - No automatic dispatcher for new physical connections
 - No current-endpoint-only firewall mode
 - Broad underlay REJECT also blocks LAN unless you intentionally change policy (not recommended without understanding the risk)
+
+## Known limitations
+
+See [docs/KNOWN_LIMITATIONS.md](docs/KNOWN_LIMITATIONS.md) for live-validated
+results, statically identified gaps, Wi-Fi status, uninstall restore-zone
+behavior, and retained managed configurations.
 
 ## Roadmap
 
