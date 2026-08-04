@@ -45,7 +45,10 @@
           - -c
           - |
             set -Eeuo pipefail
-            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            # Source the role copy from this repository, not the installed
+            # libexec tree. The first uninstall removes installed runtime files;
+            # a second uninstall must still be able to parse nmcli output.
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
             prefix={{ airvpn_connection_prefix | to_json }}
             while IFS= read -r line; do
               [[ -n "${line}" ]] || continue
@@ -69,7 +72,7 @@
           - -c
           - |
             set -Eeuo pipefail
-            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
             prefix={{ airvpn_connection_prefix | to_json }}
             changed=0
             while IFS= read -r line; do
@@ -95,7 +98,7 @@
           - -c
           - |
             set -Eeuo pipefail
-            source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"
+            source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"
             underlay={{ airvpn_underlay_zone | to_json }}
             restore={{ airvpn_restore_zone | to_json }}
             changed=0

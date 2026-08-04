@@ -34,6 +34,15 @@ else
   fail "uninstall.yml missing role defaults include_vars"
 fi
 
+# Repeated uninstall must not require installed libexec common.sh
+if grep -q 'source "{{ airvpn_install_dir }}/lib/airvpn-common.sh"' "${uninstall}"; then
+  fail "uninstall.yml sources installed libexec airvpn-common.sh (breaks second uninstall)"
+elif [[ "$(grep -c 'source "{{ playbook_dir }}/../roles/airvpn_client/files/lib/airvpn-common.sh"' "${uninstall}" || true)" -eq 3 ]]; then
+  pass "uninstall.yml sources repository role airvpn-common.sh (repeatable uninstall)"
+else
+  fail "uninstall.yml missing expected repository sources of airvpn-common.sh"
+fi
+
 # Defaults define variables uninstall uses
 defaults="${ROOT}/roles/airvpn_client/defaults/main.yml"
 for var in airvpn_runtime_scripts airvpn_state_dir airvpn_install_dir airvpn_bin_dir \

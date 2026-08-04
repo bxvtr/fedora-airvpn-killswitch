@@ -10,10 +10,14 @@ validated versus only statically identified.
 Focused on making the current direct-on-host Fedora kill-switch path safer and
 clearer without redesigning network lifecycle automation:
 
-- Make uninstall safely repeatable after a successful first run.
+- [x] Make uninstall safely repeatable after a successful first run
+  (repository-sourced `airvpn-common.sh` for NM cleanup; mocked unit test;
+  live `install → uninstall → uninstall` on Fedora Silverblue 43 still
+  recommended).
 - Add stronger post-uninstall verification (zones, profiles, paths, optional
   machine-readable checks).
-- Improve handling of partial uninstall failures.
+- Improve handling of partial uninstall failures (beyond the shared
+  runtime-library dependency already removed for NM cleanup).
 - Improve the uninstall audit collector formatting and deterministic output.
 - Clarify retained managed configuration and restore-zone behavior in operator
   messaging where helpful.

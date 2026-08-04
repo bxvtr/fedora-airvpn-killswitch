@@ -226,22 +226,22 @@ config directory manually after review.
 
 ### Repeated Uninstall
 
-**Status:** Statically identified; not yet live reproduced.
+**Status:** Fixed in source (mocked unit coverage); not yet re-validated live
+on Fedora Silverblue 43 after the fix.
 
-**Impact:** Depends on environment (second uninstall may fail after scripts
-were removed).
+**Impact (historical):** A second uninstall could fail early because NetworkManager
+cleanup tasks sourced installed
+`/usr/local/libexec/airvpn-client/lib/airvpn-common.sh`, which the first
+successful uninstall removes.
 
-Static review indicates a second uninstall may be unreliable because the first
-successful run removes runtime libraries under
-`/usr/local/libexec/airvpn-client` that later uninstall tasks still source for
-NetworkManager cleanup.
+**Current behavior:** Those tasks source
+`roles/airvpn_client/files/lib/airvpn-common.sh` from the repository checkout
+used to run the playbook, so a second uninstall no longer depends on installed
+runtime libraries. Already-absent project policies/files remain non-fatal;
+managed configs stay retained unless `airvpn_uninstall_delete_configs=true`.
 
-**Workaround:** Prefer a VM snapshot restore if uninstall must be retried after
-a successful first run; re-install scripts only if you intentionally need
-another uninstall pass.
-
-**Planned:** Safely repeatable uninstall — see [ROADMAP.md](../ROADMAP.md)
-(`v0.1.x`).
+**Remaining:** Confirm `install → uninstall → uninstall` once in the disposable
+Fedora Silverblue 43 VM. See [ROADMAP.md](../ROADMAP.md) (`v0.1.x`).
 
 ### Concurrent Runtime Operations
 
