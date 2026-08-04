@@ -175,13 +175,43 @@ else
 fi
 
 # --- Documentation: no sudo ./bootstrap.sh as an install recipe ---
-# Negated mentions (do not use sudo ./bootstrap.sh) are allowed in troubleshooting.
-if grep -R -n -E 'sudo[[:space:]]+\./bootstrap\.sh' --include='*.md' "${ROOT}" 2>/dev/null |
-  grep -viE 'not[[:space:]]|never[[:space:]]|do not|don'\''t' |
-  grep -q .; then
+# Explicit prohibitions may mention the anti-pattern, including Markdown
+# emphasis such as: do **not** use `sudo ./bootstrap.sh`
+# (plain "do not" / "not `sudo ..." remain allowed as before).
+md_sudo_bootstrap="$(
+  grep -R -n -E 'sudo[[:space:]]+\./bootstrap\.sh' --include='*.md' "${ROOT}" 2>/dev/null || true
+)"
+prohibited_install_mentions="$(
+  printf '%s\n' "${md_sudo_bootstrap}" |
+    grep -viE '(\*\*|__|\*)?not(\*\*|__|\*)?[[:space:][:punct:]]|never[[:space:][:punct:]]|do[[:space:]]+(\*\*|__|\*)?not(\*\*|__|\*)?|don'\''t' || true
+)"
+# Drop empty lines from grep -viE when input was empty
+prohibited_install_mentions="$(printf '%s\n' "${prohibited_install_mentions}" | grep -E 'sudo[[:space:]]+\./bootstrap\.sh' || true)"
+if [[ -n "${prohibited_install_mentions}" ]]; then
+  printf '%s\n' "${prohibited_install_mentions}" >&2
   fail "versioned Markdown must not document sudo ./bootstrap.sh as an install command"
 else
   pass "documented installation does not use sudo ./bootstrap.sh"
+fi
+
+# Recipe guard: a command line must never start with sudo ./bootstrap.sh
+if printf '%s\n' "${md_sudo_bootstrap}" | grep -E ':[0-9]+:[[:space:]]*sudo[[:space:]]+\./bootstrap\.sh' | grep -q .; then
+  fail "Markdown must not contain a command line starting with sudo ./bootstrap.sh"
+else
+  pass "no Markdown command line starts with sudo ./bootstrap.sh"
+fi
+
+# Regression: Markdown-emphasized prohibition used in README must remain allowed.
+if printf '%s\n' "${md_sudo_bootstrap}" | grep -q 'do \*\*not\*\* use `sudo \./bootstrap\.sh`' &&
+  ! printf '%s\n' "${prohibited_install_mentions}" | grep -q 'do \*\*not\*\* use `sudo \./bootstrap\.sh`'; then
+  pass "Markdown-emphasized do **not** sudo ./bootstrap.sh ban is accepted"
+else
+  # Accept if README no longer uses that exact emphasis, as long as no positive recipe exists
+  if [[ -z "${prohibited_install_mentions}" ]]; then
+    pass "sudo ./bootstrap.sh mentions are only prohibitions (emphasis regression optional)"
+  else
+    fail "Markdown-emphasized sudo ./bootstrap.sh prohibition incorrectly classified as install recipe"
+  fi
 fi
 
 if grep -q -- '--ask-become-pass' "${ROOT}/README.md" &&
