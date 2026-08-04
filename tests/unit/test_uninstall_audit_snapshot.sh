@@ -416,20 +416,34 @@ else
   fail "numeric SUDO owner failed"
 fi
 
-# Direct root path supported (skip check already on; ensure capture still works)
-bash "${SCRIPT}" --run-name runD --phase installed --output-root "${OUT2}"
-[[ -d "${OUT2}/runD/installed" ]] && pass "direct capture path supported with test root skip" || fail "installed phase missing"
+# Direct root path supported (skip check already on; ensure capture still works).
+# The sourced collector enables nounset/errexit in this shell; keep the capture
+# invocation from aborting the harness before assertions run.
+set +e
+bash "${SCRIPT}" --run-name runD --phase installed --output-root "${OUT2}" >/dev/null 2>&1
+rc=$?
+set -e
+if [[ "${rc}" -eq 0 && -d "${OUT2}/runD/installed" ]]; then
+  pass "direct capture path supported with test root skip"
+else
+  fail "installed phase missing (rc=${rc})"
+fi
 
 # --- Publish / interrupt safety (mocked; no live host collectors) ---
+# Keep these before any later harness abort risk; each expected-failure path
+# uses set +e. Success paths must exit 0.
 
 # Successful capture leaves no partial and no FAILED.txt
-bash "${SCRIPT}" --run-name runPub --phase baseline --output-root "${OUT2}"
+set +e
+bash "${SCRIPT}" --run-name runPub --phase baseline --output-root "${OUT2}" >/dev/null 2>&1
+rc=$?
+set -e
 pub_phase="${OUT2}/runPub/baseline"
 partials_left="$(find "${OUT2}/runPub" -maxdepth 1 -type d -name '.baseline.partial.*' 2>/dev/null | wc -l)"
-if [[ -d "${pub_phase}" && ! -e "${pub_phase}/FAILED.txt" && "${partials_left}" -eq 0 ]]; then
+if [[ "${rc}" -eq 0 && -d "${pub_phase}" && ! -e "${pub_phase}/FAILED.txt" && "${partials_left}" -eq 0 ]]; then
   pass "successful capture publishes final phase without FAILED.txt or leftover partial"
 else
-  fail "successful capture publish invariants broken"
+  fail "successful capture publish invariants broken (rc=${rc})"
 fi
 
 # Structural: capture must not wrap the collector list in broad set +e
@@ -485,12 +499,15 @@ fi
 
 # WARN/SKIP path: remove optional curl; connectivity without opt-in still publishes
 rm -f "${MOCKBIN}/curl"
-bash "${SCRIPT}" --run-name runSkip --phase baseline --output-root "${OUT_FAIL}"
-if [[ -d "${OUT_FAIL}/runSkip/baseline" && ! -e "${OUT_FAIL}/runSkip/baseline/FAILED.txt" ]] &&
+set +e
+bash "${SCRIPT}" --run-name runSkip --phase baseline --output-root "${OUT_FAIL}" >/dev/null 2>&1
+rc=$?
+set -e
+if [[ "${rc}" -eq 0 && -d "${OUT_FAIL}/runSkip/baseline" && ! -e "${OUT_FAIL}/runSkip/baseline/FAILED.txt" ]] &&
   grep -q 'not requested' "${OUT_FAIL}/runSkip/baseline/connectivity.txt"; then
   pass "WARN/SKIP optional tooling does not block successful publish"
 else
-  fail "optional SKIP path blocked publish incorrectly"
+  fail "optional SKIP path blocked publish incorrectly (rc=${rc})"
 fi
 
 # SIGINT during hanging collector: no final phase, exit 130

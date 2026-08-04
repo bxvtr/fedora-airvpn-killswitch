@@ -638,7 +638,9 @@ uas_collect_connectivity() {
       set -e
       out+="=== curl -4 ${url} ==="$'\n'
       out+="${body}"$'\n'"[exit=${rc}]"$'\n'
-      ((rc == 0)) && break
+      if ((rc == 0)); then
+        break
+      fi
     done
     set +e
     body="$(curl -6 -fsS --connect-timeout 3 --max-time 5 https://example.com 2>&1)"
@@ -814,27 +816,30 @@ Inspect or remove it manually after review."
   uas_capture_on_signal() {
     local signal_name="$1"
     local exit_code="$2"
-    trap - INT TERM ERR
+    trap - INT TERM EXIT
     publish_allowed=0
     uas_write_failure_marker "signal" "${signal_name}"
     exit "${exit_code}"
   }
 
-  uas_capture_on_err() {
+  uas_capture_on_exit() {
     local exit_code=$?
-    trap - INT TERM ERR
-    publish_allowed=0
-    uas_write_failure_marker "internal_error" "${exit_code}"
-    exit "${exit_code}"
+    # If the partial directory still exists, publish did not complete.
+    if [[ -d "${partial_dir}" && ! -e "${phase_dir}" ]]; then
+      if [[ ! -e "${partial_dir}/FAILED.txt" ]]; then
+        uas_write_failure_marker "aborted" "${exit_code}"
+      fi
+    fi
   }
 
   trap 'uas_capture_on_signal INT 130' INT
   trap 'uas_capture_on_signal TERM 143' TERM
-  trap 'uas_capture_on_err' ERR
+  trap 'uas_capture_on_exit' EXIT
 
   MANIFEST_LINES=()
   # Collectors already wrap expected non-zero host probes in narrow set +e
-  # blocks. Do not disable errexit for the whole capture body.
+  # blocks. Do not disable errexit for the whole capture body. Avoid an ERR
+  # trap here: with errtrace it can abort on benign arithmetic/`&&` statuses.
   uas_write_phase_metadata "${partial_dir}/metadata.txt"
   uas_collect_system "${partial_dir}/system.txt"
   uas_collect_repository "${partial_dir}/repository.txt"
@@ -876,7 +881,7 @@ Inspect or remove it manually after review."
   local req
   for req in "${required_files[@]}"; do
     if [[ ! -f "${partial_dir}/${req}" ]]; then
-      trap - INT TERM ERR
+      trap - INT TERM EXIT
       uas_write_failure_marker "missing_artifact" "${req}"
       die "Capture incomplete: missing required artifact ${req} (partial left at ${partial_dir})"
     fi
@@ -889,32 +894,32 @@ Inspect or remove it manually after review."
   done
   uas_write_file "${partial_dir}/manifest.txt" "${manifest}"
   [[ -f "${partial_dir}/manifest.txt" ]] || {
-    trap - INT TERM ERR
+    trap - INT TERM EXIT
     uas_write_failure_marker "missing_artifact" "manifest.txt"
     die "Capture incomplete: manifest.txt was not written (partial left at ${partial_dir})"
   }
 
   if [[ -e "${partial_dir}/FAILED.txt" ]]; then
-    trap - INT TERM ERR
+    trap - INT TERM EXIT
     die "Capture marked failed; refusing to publish (partial left at ${partial_dir})"
   fi
 
   # Atomic publish: only behind the explicit success gate.
   if [[ -e "${phase_dir}" ]]; then
-    trap - INT TERM ERR
+    trap - INT TERM EXIT
     uas_write_failure_marker "phase_conflict" "phase_appeared"
     die "Phase directory appeared during capture; leaving partial at ${partial_dir}"
   fi
 
   publish_allowed=1
   if ((publish_allowed != 1)); then
-    trap - INT TERM ERR
+    trap - INT TERM EXIT
     uas_write_failure_marker "internal_error" "publish_gate"
     die "Publish gate closed; leaving partial at ${partial_dir}"
   fi
 
   mv -- "${partial_dir}" "${phase_dir}"
-  trap - INT TERM ERR
+  trap - INT TERM EXIT
   chmod 0700 -- "${phase_dir}" || true
   if [[ -e "${phase_dir}/FAILED.txt" ]]; then
     die "Published phase unexpectedly contains FAILED.txt: ${phase_dir}"
