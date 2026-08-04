@@ -58,7 +58,7 @@ jobs:
               -type f \( \
                 -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' \
                 -o -name 'validate-safe' -o -name 'check-agent-safety' \
-                -o -name 'integration-test-vm' \
+                -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \
               \) | sort
           )
           shellcheck -x -S error "${files[@]}"
@@ -73,6 +73,18 @@ jobs:
             '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' \
             tools/validate-safe; then
             echo "ERROR: tools/validate-safe must not execute tools/integration-test-vm" >&2
+            exit 1
+          fi
+          if grep -R -n -E \
+            '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+            .github/workflows 2>/dev/null; then
+            echo "ERROR: tools/uninstall-audit-snapshot must not be executed from CI workflows" >&2
+            exit 1
+          fi
+          if grep -E -q \
+            '^[[:space:]]*(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+            tools/validate-safe; then
+            echo "ERROR: tools/validate-safe must not execute tools/uninstall-audit-snapshot" >&2
             exit 1
           fi
 

@@ -92,7 +92,7 @@ Manual equivalents:
 bash tests/unit/run_all.sh
 yamllint -c .yamllint .
 ansible-lint
-find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' \) -print0 | xargs -0 shellcheck -x -S error
+find bootstrap.sh roles/airvpn_client/files tests/unit tests/integration/lib tools -type f \( -name '*.sh' -o -name 'airvpn-*' -o -name 'bootstrap.sh' -o -name 'validate-safe' -o -name 'check-agent-safety' -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \) -print0 | xargs -0 shellcheck -x -S error
 for pb in playbooks/*.yml; do
   ansible-playbook --syntax-check "$pb" -e airvpn_config_source=/tmp/dummy -e airvpn_uninstall_confirmed=true
 done

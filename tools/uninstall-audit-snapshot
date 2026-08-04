@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# Manual read-only uninstall / install state snapshot collector for disposable
+# Fedora VMs. Captures host state into phase directories under a durable output
+# root. Never installs, uninstalls, or mutates networking / packages / services.
+#
+# Not invoked by bootstrap, Ansible, integration-test-vm, CI, or validate-safe.
+#
+# Default output root is /var/tmp/fedora-airvpn-uninstall-audit so after-reboot
+# phases for the same --run-name survive a reboot (/tmp is often wiped).
+set -Eeuo pipefail
+umask 077
+
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
+SCRIPT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")" && pwd)"
+ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+
+UAS_DEFAULT_OUTPUT_ROOT="/var/tmp/fedora-airvpn-uninstall-audit"
+UAS_RUN_NAME_MAX=80
+UAS_COLLECTOR_ID="uninstall-audit-snapshot/1"
+
+# Test-only: unit tests may set UAS_SKIP_ROOT_CHECK=1 with mocked PATH tools.
+# Not a supported operator bypass.
+
+RUN_NAME=""
+PHASE=""
+OUTPUT_ROOT="${UAS_DEFAULT_OUTPUT_ROOT}"
+COMPARE_MODE=0
+INCLUDE_CONNECTIVITY=0
+
+MANIFEST_LINES=()
+CAPTURE_FAILED=0
+
+usage() {
+  cat <<'EOF'
+Usage:
+  sudo tools/uninstall-audit-snapshot --run-name NAME --phase PHASE [options]
+  sudo tools/uninstall-audit-snapshot --run-name NAME --compare [options]
+
+Manual read-only state collector for uninstall audits on a disposable Fedora VM.
+Never runs install.yml, uninstall.yml, bootstrap, or tools/integration-test-vm.
+Never mutates NetworkManager, firewalld, WireGuard, services, or packages.
+
+Required (capture mode):
+  --run-name NAME   Logical audit run id (A-Z a-z 0-9 . _ - ; max 80; no leading .)
+  --phase PHASE     baseline | installed | uninstalled | after-reboot
+
+Required (compare mode):
+  --run-name NAME
+  --compare         Diff existing phase snapshots only (no host probes)
+
+Optional:
+  --output-root DIR Absolute durable output root (default:
+                    /var/tmp/fedora-airvpn-uninstall-audit). Survives reboot;
+                    must stay outside the repository and system roots.
+  --include-connectivity
+                    Opt-in external DNS/HTTPS/public-IP probes (network metadata).
+  -h, --help        Show this help
+
+Safety:
+  - Requires root for capture (incomplete read-only data otherwise)
+  - Refuses to overwrite an existing phase directory (no --force)
+  - Publishes each phase atomically from a private partial directory
+  - Does not read WireGuard private material or NetworkManager keyfile secrets
+  - Artifacts may still contain network metadata (zones, endpoints, public IPs)
+
+Example lifecycle (manual install/uninstall between captures):
+  sudo tools/uninstall-audit-snapshot --run-name demo --phase baseline
+  sudo tools/uninstall-audit-snapshot --run-name demo --phase installed
+  sudo tools/uninstall-audit-snapshot --run-name demo --phase uninstalled
+  sudo tools/uninstall-audit-snapshot --run-name demo --phase after-reboot
+  sudo tools/uninstall-audit-snapshot --run-name demo --compare
+EOF
+}
+
+log() { printf '[uninstall-audit-snapshot] %s\n' "$*"; }
+die() {
+  printf '[uninstall-audit-snapshot] ERROR: %s\n' "$*" >&2
+  exit 2
+}
+
+have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+uas_is_valid_run_name() {
+  local name="$1"
+  [[ -n "${name}" ]] || return 1
+  ((${#name} <= UAS_RUN_NAME_MAX)) || return 1
+  [[ "${name}" != .* ]] || return 1
+  [[ "${name}" != ".." ]] || return 1
+  [[ "${name}" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  return 0
+}
+
+uas_is_valid_phase() {
+  case "$1" in
+    baseline | installed | uninstalled | after-reboot) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+uas_require_root() {
+  if [[ "${UAS_SKIP_ROOT_CHECK:-}" == "1" ]]; then
+    return 0
+  fi
+  if [[ "${EUID}" -ne 0 ]]; then
+    die "This read-only audit collector must be run as root, for example:
+sudo tools/uninstall-audit-snapshot ..."
+  fi
+}
+
+# Numeric SUDO_UID/SUDO_GID only; empty if unsafe or direct root.
+uas_sudo_owner() {
+  local uid="${SUDO_UID-}" gid="${SUDO_GID-}"
+  if [[ -n "${uid}" && "${uid}" =~ ^[0-9]+$ && -n "${gid}" && "${gid}" =~ ^[0-9]+$ && "${uid}" != "0" ]]; then
+    printf '%s %s\n' "${uid}" "${gid}"
+    return 0
+  fi
+  return 1
+}
+
+uas_output_root_is_safe() {
+  local path="$1"
+  local repo="$2"
+  local resolved
+  [[ -n "${path}" && "${path}" == /* ]] || return 1
+  resolved="$(readlink -m -- "${path}")"
+  [[ -n "${resolved}" && "${resolved}" == /* ]] || return 1
+  case "${resolved}" in
+    / | /etc | /etc/* | /usr | /usr/* | /boot | /boot/* | /root | /root/* | /run | /run/* | /proc | /proc/* | /sys | /sys/* | /dev | /dev/*)
+      return 1
+      ;;
+    /var | /home | /tmp | /opt | /srv)
+      return 1
+      ;;
+    /etc/airvpn-client | /etc/airvpn-client/*)
+      return 1
+      ;;
+  esac
+  if [[ -n "${repo}" ]]; then
+    case "${resolved}" in
+      "${repo}" | "${repo}"/*) return 1 ;;
+    esac
+  fi
+  # Reject if any existing path component is a symlink (symlink escape).
+  local cur="" part
+  local IFS='/'
+  # shellcheck disable=SC2086
+  set -- ${resolved#/}
+  cur=""
+  for part in "$@"; do
+    cur="${cur}/${part}"
+    if [[ -L "${cur}" ]]; then
+      return 1
+    fi
+  done
+  return 0
+}
+
+uas_git_field() {
+  local field="$1"
+  if [[ ! -d "${ROOT}/.git" ]] || ! have_cmd git; then
+    printf 'unavailable\n'
+    return 0
+  fi
+  case "${field}" in
+    head)
+      git -C "${ROOT}" rev-parse HEAD 2>/dev/null || printf 'unavailable\n'
+      ;;
+    branch)
+      git -C "${ROOT}" branch --show-current 2>/dev/null || printf 'unavailable\n'
+      ;;
+    dirty)
+      if git -C "${ROOT}" status --porcelain 2>/dev/null | grep -q .; then
+        printf 'yes\n'
+      else
+        printf 'no\n'
+      fi
+      ;;
+    log1)
+      git -C "${ROOT}" log -1 --oneline 2>/dev/null || printf 'unavailable\n'
+      ;;
+    status)
+      git -C "${ROOT}" status --short 2>/dev/null || printf 'unavailable\n'
+      ;;
+    *)
+      printf 'unavailable\n'
+      ;;
+  esac
+}
+
+uas_write_file() {
+  local dest="$1"
+  local content="$2"
+  local tmp
+  tmp="$(mktemp "${dest}.tmp.XXXXXX")"
+  printf '%s' "${content}" >"${tmp}"
+  chmod 0600 "${tmp}"
+  mv -f -- "${tmp}" "${dest}"
+}
+
+uas_append_manifest() {
+  MANIFEST_LINES+=("$1")
+}
+
+uas_capture_cmd() {
+  # uas_capture_cmd outfile label cmd...
+  local outfile="$1"
+  local label="$2"
+  shift 2
+  local out rc=0
+  if ! have_cmd "$1"; then
+    uas_write_file "${outfile}" "SKIP: command not found: $1"$'\n'
+    uas_append_manifest "SKIP ${label} — $1 not available"
+    return 0
+  fi
+  set +e
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  uas_write_file "${outfile}" "${out}"$'\n'"[exit=${rc}]"$'\n'
+  if ((rc == 0)); then
+    uas_append_manifest "PASS ${label}"
+  else
+    uas_append_manifest "WARN ${label} — exit ${rc}"
+  fi
+  return 0
+}
+
+# Strict parse of selected non-secret assignments from airvpn-client.conf.
+# Never sources or evals the file.
+uas_parse_project_conf_names() {
+  local conf="/etc/airvpn-client/airvpn-client.conf"
+  AIRVPN_ZONE_EFF="airvpn"
+  AIRVPN_UNDERLAY_ZONE_EFF="vpn-underlay"
+  AIRVPN_POLICY_TO_VPN_EFF="airvpn-host-vpn"
+  AIRVPN_POLICY_TO_UNDERLAY_EFF="airvpn-host-under"
+  AIRVPN_RESTORE_ZONE_EFF="public"
+  AIRVPN_CONNECTION_PREFIX_EFF="AirVPN - "
+  CONF_PARSE_WARNINGS=()
+  [[ -f "${conf}" ]] || return 0
+  local line key val
+  while IFS= read -r line || [[ -n "${line}" ]]; do
+    [[ -n "${line}" ]] || continue
+    [[ "${line}" =~ ^[[:space:]]*# ]] && continue
+    if [[ "${line}" =~ ^(AIRVPN_ZONE|AIRVPN_UNDERLAY_ZONE|AIRVPN_POLICY_TO_VPN|AIRVPN_POLICY_TO_UNDERLAY|AIRVPN_RESTORE_ZONE|AIRVPN_CONNECTION_PREFIX)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      if [[ "${val}" =~ ^\"([A-Za-z0-9._: /+-]*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "${val}" =~ ^\'([A-Za-z0-9._: /+-]*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "${val}" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
+        :
+      else
+        CONF_PARSE_WARNINGS+=("ignored unsafe assignment for ${key}")
+        continue
+      fi
+      case "${key}" in
+        AIRVPN_ZONE) AIRVPN_ZONE_EFF="${val}" ;;
+        AIRVPN_UNDERLAY_ZONE) AIRVPN_UNDERLAY_ZONE_EFF="${val}" ;;
+        AIRVPN_POLICY_TO_VPN) AIRVPN_POLICY_TO_VPN_EFF="${val}" ;;
+        AIRVPN_POLICY_TO_UNDERLAY) AIRVPN_POLICY_TO_UNDERLAY_EFF="${val}" ;;
+        AIRVPN_RESTORE_ZONE) AIRVPN_RESTORE_ZONE_EFF="${val}" ;;
+        AIRVPN_CONNECTION_PREFIX) AIRVPN_CONNECTION_PREFIX_EFF="${val}" ;;
+      esac
+    else
+      if [[ "${line}" =~ ^AIRVPN_ ]]; then
+        CONF_PARSE_WARNINGS+=("ignored non-allowlisted or malformed line")
+      fi
+    fi
+  done <"${conf}"
+}
+
+uas_stat_path_line() {
+  local path="$1"
+  if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+    printf 'MISSING %s\n' "${path}"
+    return 0
+  fi
+  if have_cmd stat; then
+    # Portable-ish GNU/stat format used on Fedora.
+    stat --printf='PATH=%n TYPE=%F OWNER=%U GROUP=%G MODE=%a SIZE=%s MTIME=%y' "${path}" 2>/dev/null ||
+      printf 'PATH=%s STAT_ERROR\n' "${path}"
+    if [[ -L "${path}" ]]; then
+      printf ' SYMLINK_TARGET=%s' "$(readlink -- "${path}" 2>/dev/null || echo '?')"
+    fi
+    printf '\n'
+  else
+    printf 'PATH=%s PRESENT (stat unavailable)\n' "${path}"
+  fi
+}
+
+uas_collect_filesystem() {
+  local dest="$1"
+  local out="" path
+  local paths=(
+    /etc/airvpn-client
+    /etc/airvpn-client/configs
+    /etc/airvpn-client/airvpn-client.conf
+    /usr/local/libexec/airvpn-client
+    /var/lib/airvpn-client
+    /run/airvpn-client.lock
+    /usr/local/bin/airvpn-import
+    /usr/local/bin/airvpn-switch
+    /usr/local/bin/airvpn-firewall-sync
+    /usr/local/bin/airvpn-protect-connection
+    /usr/local/bin/airvpn-status
+    /usr/local/bin/airvpn-check
+    /usr/local/bin/airvpn-killswitch
+  )
+  out+="=== project path inventory (metadata only; no config contents) ==="$'\n'
+  for path in "${paths[@]}"; do
+    out+="$(uas_stat_path_line "${path}")"
+  done
+  out+=$'\n'"=== /etc/airvpn-client/configs entries (names/metadata only) ==="$'\n'
+  if [[ -d /etc/airvpn-client/configs ]]; then
+    local f
+    # shellcheck disable=SC2012
+    while IFS= read -r f; do
+      [[ -n "${f}" ]] || continue
+      out+="$(uas_stat_path_line "${f}")"
+    done < <(find /etc/airvpn-client/configs -maxdepth 1 -mindepth 1 \( -type f -o -type l \) -print 2>/dev/null | LC_ALL=C sort || true)
+  else
+    out+="SKIP: configs directory absent"$'\n'
+  fi
+  out+=$'\n'"=== /usr/local/libexec/airvpn-client shallow listing ==="$'\n'
+  if [[ -d /usr/local/libexec/airvpn-client ]]; then
+    find /usr/local/libexec/airvpn-client -maxdepth 2 \( -type f -o -type l -o -type d \) -print 2>/dev/null | LC_ALL=C sort |
+      while IFS= read -r f; do
+        uas_stat_path_line "${f}"
+      done >>"${dest}.building" 2>/dev/null || true
+    if [[ -f "${dest}.building" ]]; then
+      out+="$(cat "${dest}.building")"
+      rm -f -- "${dest}.building"
+    fi
+  else
+    out+="SKIP: install dir absent"$'\n'
+  fi
+  out+=$'\n'"=== /var/lib/airvpn-client shallow listing ==="$'\n'
+  if [[ -d /var/lib/airvpn-client ]]; then
+    find /var/lib/airvpn-client -maxdepth 1 -mindepth 1 -print 2>/dev/null | LC_ALL=C sort |
+      while IFS= read -r f; do
+        uas_stat_path_line "${f}"
+      done >>"${dest}.building2" 2>/dev/null || true
+    if [[ -f "${dest}.building2" ]]; then
+      out+="$(cat "${dest}.building2")"
+      rm -f -- "${dest}.building2"
+    fi
+  else
+    out+="SKIP: state dir absent"$'\n'
+  fi
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS filesystem.txt"
+}
+
+uas_collect_networkmanager() {
+  local dir="$1"
+  local out rc
+  if ! have_cmd nmcli; then
+    uas_write_file "${dir}/networkmanager-connections.txt" "SKIP: nmcli not available"$'\n'
+    uas_write_file "${dir}/networkmanager-active.txt" "SKIP: nmcli not available"$'\n'
+    uas_write_file "${dir}/networkmanager-zones.txt" "SKIP: nmcli not available"$'\n'
+    uas_write_file "${dir}/networkmanager-devices.txt" "SKIP: nmcli not available"$'\n'
+    uas_append_manifest "SKIP networkmanager-* — nmcli not available"
+    return 0
+  fi
+  # Explicit non-secret fields only (never request secret display; no full show; no export).
+  set +e
+  out="$(nmcli -t -f UUID,NAME,TYPE,DEVICE,STATE connection show 2>&1 | LC_ALL=C sort)"
+  rc=$?
+  set -e
+  uas_write_file "${dir}/networkmanager-connections.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
+
+  set +e
+  out="$(nmcli -t -f UUID,NAME,TYPE,DEVICE connection show --active 2>&1 | LC_ALL=C sort)"
+  rc=$?
+  set -e
+  uas_write_file "${dir}/networkmanager-active.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
+
+  local zones="" line uuid
+  zones+="=== connection.zone / autoconnect / interface-name (explicit -g fields) ==="$'\n'
+  while IFS= read -r line; do
+    [[ -n "${line}" ]] || continue
+    uuid="${line%%:*}"
+    [[ -n "${uuid}" ]] || continue
+    set +e
+    out="$(nmcli -g connection.zone,connection.autoconnect,connection.interface-name connection show "${uuid}" 2>&1)"
+    rc=$?
+    set -e
+    zones+="UUID=${uuid}"$'\n'"${out}"$'\n'"[exit=${rc}]"$'\n'
+  done < <(nmcli -t -f UUID connection show 2>/dev/null | LC_ALL=C sort || true)
+  uas_write_file "${dir}/networkmanager-zones.txt" "${zones}"
+
+  set +e
+  out="$(nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status 2>&1 | LC_ALL=C sort)"
+  rc=$?
+  set -e
+  uas_write_file "${dir}/networkmanager-devices.txt" "${out}"$'\n'"[exit=${rc}]"$'\n'
+  uas_append_manifest "PASS networkmanager-*.txt"
+}
+
+uas_fw_info_if_present() {
+  local mode="$1" # permanent|runtime
+  local kind="$2" # zone|policy
+  local name="$3"
+  local args=()
+  if [[ "${mode}" == permanent ]]; then
+    args+=(--permanent)
+  fi
+  if [[ "${kind}" == zone ]]; then
+    args+=(--info-zone="${name}")
+  else
+    args+=(--info-policy="${name}")
+  fi
+  local out rc=0
+  set +e
+  out="$(firewall-cmd "${args[@]}" 2>&1)"
+  rc=$?
+  set -e
+  if ((rc == 0)); then
+    printf 'PRESENT %s %s %s\n%s\n' "${mode}" "${kind}" "${name}" "${out}"
+  else
+    printf 'ABSENT_OR_ERROR %s %s %s exit=%s\n%s\n' "${mode}" "${kind}" "${name}" "${rc}" "${out}"
+  fi
+}
+
+uas_collect_firewalld() {
+  local dir="$1"
+  if ! have_cmd firewall-cmd; then
+    for f in firewalld-permanent-zones.txt firewalld-permanent-policies.txt firewalld-project-objects.txt \
+      firewalld-runtime-zones.txt firewalld-runtime-policies.txt firewalld-active-zones.txt; do
+      uas_write_file "${dir}/${f}" "SKIP: firewall-cmd not available"$'\n'
+    done
+    uas_append_manifest "SKIP firewalld-* — firewall-cmd not available"
+    return 0
+  fi
+  uas_capture_cmd "${dir}/firewalld-permanent-zones.txt" "firewalld-permanent-zones.txt" \
+    firewall-cmd --permanent --get-zones
+  uas_capture_cmd "${dir}/firewalld-permanent-policies.txt" "firewalld-permanent-policies.txt" \
+    firewall-cmd --permanent --get-policies
+  uas_capture_cmd "${dir}/firewalld-runtime-zones.txt" "firewalld-runtime-zones.txt" \
+    firewall-cmd --get-zones
+  uas_capture_cmd "${dir}/firewalld-runtime-policies.txt" "firewalld-runtime-policies.txt" \
+    firewall-cmd --get-policies
+  uas_capture_cmd "${dir}/firewalld-active-zones.txt" "firewalld-active-zones.txt" \
+    firewall-cmd --get-active-zones
+
+  uas_parse_project_conf_names
+  local proj="=== project object details (permanent then runtime) ==="$'\n'
+  proj+="parsed_names: zone=${AIRVPN_ZONE_EFF} underlay=${AIRVPN_UNDERLAY_ZONE_EFF}"
+  proj+=" policy_vpn=${AIRVPN_POLICY_TO_VPN_EFF} policy_under=${AIRVPN_POLICY_TO_UNDERLAY_EFF}"
+  proj+=" restore=${AIRVPN_RESTORE_ZONE_EFF} prefix=${AIRVPN_CONNECTION_PREFIX_EFF}"$'\n'
+  if ((${#CONF_PARSE_WARNINGS[@]} > 0)); then
+    proj+="parse_warnings:"$'\n'
+    proj+="$(printf '%s\n' "${CONF_PARSE_WARNINGS[@]}")"$'\n'
+  fi
+  local z p
+  local zones=(
+    "${AIRVPN_ZONE_EFF}"
+    "${AIRVPN_UNDERLAY_ZONE_EFF}"
+    airvpn
+    vpn-underlay
+  )
+  local policies=(
+    "${AIRVPN_POLICY_TO_VPN_EFF}"
+    "${AIRVPN_POLICY_TO_UNDERLAY_EFF}"
+    airvpn-host-vpn
+    airvpn-host-under
+    airvpn-host-to-vpn
+    airvpn-host-to-underlay
+  )
+  proj+=$'\n'"=== zones ==="$'\n'
+  while IFS= read -r z; do
+    [[ -n "${z}" ]] || continue
+    proj+="$(uas_fw_info_if_present permanent zone "${z}")"$'\n'
+    proj+="$(uas_fw_info_if_present runtime zone "${z}")"$'\n'
+  done < <(printf '%s\n' "${zones[@]}" | LC_ALL=C sort -u)
+  proj+=$'\n'"=== policies ==="$'\n'
+  while IFS= read -r p; do
+    [[ -n "${p}" ]] || continue
+    proj+="$(uas_fw_info_if_present permanent policy "${p}")"$'\n'
+    proj+="$(uas_fw_info_if_present runtime policy "${p}")"$'\n'
+  done < <(printf '%s\n' "${policies[@]}" | LC_ALL=C sort -u)
+  uas_write_file "${dir}/firewalld-project-objects.txt" "${proj}"
+  uas_append_manifest "PASS firewalld-project-objects.txt"
+}
+
+uas_collect_routing() {
+  local dir="$1"
+  if have_cmd ip; then
+    uas_capture_cmd "${dir}/routing-ipv4.txt" "routing-ipv4.txt" ip -4 route show table all
+    uas_capture_cmd "${dir}/routing-ipv6.txt" "routing-ipv6.txt" ip -6 route show table all
+    local rules=""
+    local out rc
+    set +e
+    out="$(ip -4 rule show 2>&1)"
+    rc=$?
+    set -e
+    rules+="=== ip -4 rule show ==="$'\n'"${out}"$'\n'"[exit=${rc}]"$'\n'
+    set +e
+    out="$(ip -6 rule show 2>&1)"
+    rc=$?
+    set -e
+    rules+="=== ip -6 rule show ==="$'\n'"${out}"$'\n'"[exit=${rc}]"$'\n'
+    uas_write_file "${dir}/routing-rules.txt" "${rules}"
+    uas_append_manifest "PASS routing-rules.txt"
+  else
+    for f in routing-ipv4.txt routing-ipv6.txt routing-rules.txt; do
+      uas_write_file "${dir}/${f}" "SKIP: ip not available"$'\n'
+    done
+    uas_append_manifest "SKIP routing-* — ip not available"
+  fi
+}
+
+uas_collect_wireguard() {
+  local dest="$1"
+  if ! have_cmd wg; then
+    uas_write_file "${dest}" "SKIP: wg not available"$'\n'
+    uas_append_manifest "SKIP wireguard-runtime.txt — wg not available"
+    return 0
+  fi
+  # Never request dump or showconf forms (those expose private key material).
+  # Plain interface status prints public keys / endpoints / handshakes / transfer only.
+  local out rc=0 ifaces
+  set +e
+  ifaces="$(wg show interfaces 2>&1)"
+  rc=$?
+  set -e
+  out="=== wg show interfaces ==="$'\n'"${ifaces}"$'\n'"[exit=${rc}]"$'\n'
+  out+=$'\n'"=== wg show (volatile counters/handshakes; no private keys) ==="$'\n'
+  set +e
+  out+="$(wg show 2>&1)"$'\n'
+  rc=$?
+  set -e
+  out+="[exit=${rc}]"$'\n'
+  out+=$'\n'"NOTE: transfer counters and handshake ages are volatile."$'\n'
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS wireguard-runtime.txt (volatile runtime metadata)"
+}
+
+uas_collect_dns() {
+  local dest="$1"
+  if have_cmd resolvectl; then
+    uas_capture_cmd "${dest}" "dns.txt" resolvectl status
+  else
+    uas_write_file "${dest}" "SKIP: resolvectl not available"$'\n'
+    uas_append_manifest "SKIP dns.txt — resolvectl not available"
+  fi
+}
+
+uas_collect_services() {
+  local dest="$1"
+  local out="" svc
+  if ! have_cmd systemctl; then
+    uas_write_file "${dest}" "SKIP: systemctl not available"$'\n'
+    uas_append_manifest "SKIP services.txt — systemctl not available"
+    return 0
+  fi
+  for svc in NetworkManager firewalld systemd-resolved; do
+    local active_rc=0 enabled_rc=0 active_out enabled_out
+    set +e
+    active_out="$(systemctl is-active "${svc}" 2>&1)"
+    active_rc=$?
+    enabled_out="$(systemctl is-enabled "${svc}" 2>&1)"
+    enabled_rc=$?
+    set -e
+    out+="service=${svc}"$'\n'
+    out+="is-active=${active_out} [exit=${active_rc}]"$'\n'
+    out+="is-enabled=${enabled_out} [exit=${enabled_rc}]"$'\n'
+  done
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS services.txt"
+}
+
+uas_collect_packages() {
+  local dir="$1"
+  local pkgs=(NetworkManager firewalld wireguard-tools python3 python3-firewall)
+  local out="" p
+  if have_cmd rpm; then
+    out+="=== rpm -q (selected project prerequisites) ==="$'\n'
+    for p in "${pkgs[@]}"; do
+      local rc=0 line
+      set +e
+      line="$(rpm -q "${p}" 2>&1)"
+      rc=$?
+      set -e
+      out+="${line} [exit=${rc}]"$'\n'
+    done
+    uas_write_file "${dir}/packages.txt" "${out}"
+    uas_append_manifest "PASS packages.txt"
+  else
+    uas_write_file "${dir}/packages.txt" "SKIP: rpm not available"$'\n'
+    uas_append_manifest "SKIP packages.txt — rpm not available"
+  fi
+  if have_cmd rpm-ostree; then
+    uas_capture_cmd "${dir}/rpm-ostree.txt" "rpm-ostree.txt" rpm-ostree status
+  else
+    uas_write_file "${dir}/rpm-ostree.txt" "SKIP: rpm-ostree not available"$'\n'
+    uas_append_manifest "SKIP rpm-ostree.txt — rpm-ostree not available"
+  fi
+}
+
+uas_collect_connectivity() {
+  local dest="$1"
+  if ((INCLUDE_CONNECTIVITY == 0)); then
+    uas_write_file "${dest}" "WARN: connectivity not requested (pass --include-connectivity)"$'\n'
+    uas_append_manifest "WARN connectivity.txt — not requested"
+    return 0
+  fi
+  local out="" rc body
+  out+="NOTE: public IPs and probe results are sensitive network metadata."$'\n'
+  if have_cmd getent; then
+    set +e
+    out+="=== getent hosts example.com ==="$'\n'
+    out+="$(getent hosts example.com 2>&1)"$'\n'
+    rc=$?
+    set -e
+    out+="[exit=${rc}]"$'\n'
+  else
+    out+="SKIP DNS: getent not available"$'\n'
+  fi
+  if have_cmd curl; then
+    local url
+    for url in \
+      https://example.com \
+      https://ipv4.icanhazip.com \
+      https://api.ipify.org \
+      https://ifconfig.me/ip; do
+      set +e
+      body="$(curl -4 -fsS --connect-timeout 3 --max-time 5 "${url}" 2>&1)"
+      rc=$?
+      set -e
+      out+="=== curl -4 ${url} ==="$'\n'
+      out+="${body}"$'\n'"[exit=${rc}]"$'\n'
+      ((rc == 0)) && break
+    done
+    set +e
+    body="$(curl -6 -fsS --connect-timeout 3 --max-time 5 https://example.com 2>&1)"
+    rc=$?
+    set -e
+    out+="=== curl -6 https://example.com ==="$'\n'"${body}"$'\n'"[exit=${rc}]"$'\n'
+  else
+    out+="SKIP HTTPS: curl not available"$'\n'
+  fi
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS connectivity.txt (opt-in probes)"
+}
+
+uas_collect_system() {
+  local dest="$1"
+  local out=""
+  out+="NOTE: capture timestamps below are volatile metadata."$'\n'
+  if have_cmd date; then
+    out+="date=$(date --iso-8601=seconds 2>/dev/null || date -Iseconds 2>/dev/null || date)"$'\n'
+  fi
+  if have_cmd hostnamectl; then
+    set +e
+    out+=$'\n'"=== hostnamectl ==="$'\n'"$(hostnamectl 2>&1)"$'\n'
+    set -e
+  else
+    out+=$'\n'"SKIP hostnamectl"$'\n'
+  fi
+  if have_cmd uname; then
+    out+=$'\n'"uname=$(uname -a)"$'\n'
+  fi
+  if [[ -r /etc/os-release ]]; then
+    out+=$'\n'"=== /etc/os-release ==="$'\n'"$(cat /etc/os-release)"$'\n'
+  fi
+  if have_cmd systemd-detect-virt; then
+    set +e
+    out+=$'\n'"virt=$(systemd-detect-virt 2>&1)"$'\n'
+    set -e
+  else
+    out+=$'\n'"SKIP systemd-detect-virt"$'\n'
+  fi
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS system.txt (includes volatile timestamps)"
+}
+
+uas_collect_repository() {
+  local dest="$1"
+  local out=""
+  out+="repo_root=${ROOT}"$'\n'
+  out+="HEAD=$(uas_git_field head)"$'\n'
+  out+="branch=$(uas_git_field branch)"$'\n'
+  out+="dirty=$(uas_git_field dirty)"$'\n'
+  out+="log1=$(uas_git_field log1)"$'\n'
+  out+=$'\n'"=== git status --short ==="$'\n'
+  out+="$(uas_git_field status)"$'\n'
+  uas_write_file "${dest}" "${out}"
+  uas_append_manifest "PASS repository.txt"
+}
+
+uas_chown_tree_if_sudo_user() {
+  local target="$1"
+  local owner
+  if owner="$(uas_sudo_owner)"; then
+    local uid gid
+    uid="${owner% *}"
+    gid="${owner#* }"
+    chown -R "${uid}:${gid}" -- "${target}" 2>/dev/null || true
+  fi
+}
+
+uas_ensure_run_metadata() {
+  local run_dir="$1"
+  local meta="${run_dir}/run-metadata.txt"
+  if [[ -e "${meta}" ]]; then
+    return 0
+  fi
+  local virt="unavailable" fedora="unavailable" variant="unavailable" host="unavailable"
+  [[ -r /etc/os-release ]] && fedora="$(grep -E '^(NAME|VERSION_ID|VARIANT_ID)=' /etc/os-release | tr '\n' ' ')"
+  have_cmd hostname && host="$(hostname)"
+  have_cmd systemd-detect-virt && virt="$(systemd-detect-virt 2>/dev/null || echo unavailable)"
+  local body=""
+  body+="run_name=${RUN_NAME}"$'\n'
+  body+="created_at=$(date --iso-8601=seconds 2>/dev/null || date)"$'\n'
+  body+="repository_git_revision=$(uas_git_field head)"$'\n'
+  body+="repository_git_branch=$(uas_git_field branch)"$'\n'
+  body+="repository_dirty=$(uas_git_field dirty)"$'\n'
+  body+="collector_version_or_git_revision=${UAS_COLLECTOR_ID} @ $(uas_git_field head)"$'\n'
+  body+="hostname=${host}"$'\n'
+  body+="fedora_version=${fedora}"$'\n'
+  body+="variant=${variant}"$'\n'
+  body+="virtualization=${virt}"$'\n'
+  uas_write_file "${meta}" "${body}"
+}
+
+uas_write_phase_metadata() {
+  local dest="$1"
+  local body=""
+  body+="run_name=${RUN_NAME}"$'\n'
+  body+="phase=${PHASE}"$'\n'
+  body+="captured_at=$(date --iso-8601=seconds 2>/dev/null || date)"$'\n'
+  body+="hostname=$(hostname 2>/dev/null || echo unavailable)"$'\n'
+  body+="kernel=$(uname -r 2>/dev/null || echo unavailable)"$'\n'
+  body+="fedora_version=$(grep ^VERSION_ID= /etc/os-release 2>/dev/null || echo unavailable)"$'\n'
+  body+="variant=$(grep ^VARIANT_ID= /etc/os-release 2>/dev/null || echo unavailable)"$'\n'
+  body+="virtualization=$(systemd-detect-virt 2>/dev/null || echo unavailable)"$'\n'
+  body+="repository_git_revision=$(uas_git_field head)"$'\n'
+  body+="repository_git_branch=$(uas_git_field branch)"$'\n'
+  body+="repository_dirty=$(uas_git_field dirty)"$'\n'
+  body+="collector_path=${SCRIPT_PATH}"$'\n'
+  uas_write_file "${dest}" "${body}"
+}
+
+uas_run_capture() {
+  uas_require_root
+  uas_is_valid_run_name "${RUN_NAME}" || die "Invalid --run-name (allowed: A-Z a-z 0-9 . _ -; max ${UAS_RUN_NAME_MAX}; no leading dot, no slashes)"
+  uas_is_valid_phase "${PHASE}" || die "Invalid --phase (expected: baseline|installed|uninstalled|after-reboot)"
+  uas_output_root_is_safe "${OUTPUT_ROOT}" "${ROOT}" ||
+    die "Unsafe --output-root (must be absolute, outside the repository and system roots; prefer /var/tmp/...)"
+
+  local run_dir phase_dir partial_dir
+  run_dir="$(readlink -m -- "${OUTPUT_ROOT}/${RUN_NAME}")"
+  phase_dir="${run_dir}/${PHASE}"
+  partial_dir="${run_dir}/.${PHASE}.partial.$$"
+
+  case "${run_dir}" in
+    "${ROOT}" | "${ROOT}"/*) die "Run directory resolves inside the repository" ;;
+  esac
+
+  if [[ -e "${phase_dir}" ]]; then
+    die "Refusing to overwrite existing phase snapshot:
+${phase_dir}
+Choose a different --run-name or remove the old audit run manually after review."
+  fi
+  if [[ -e "${partial_dir}" ]]; then
+    die "Refusing to reuse existing partial directory:
+${partial_dir}"
+  fi
+  # Any other partial for this phase?
+  local other
+  for other in "${run_dir}/.${PHASE}.partial."*; do
+    if [[ -e "${other}" ]]; then
+      die "Refusing to proceed while a prior partial directory exists:
+${other}
+Inspect or remove it manually after review."
+    fi
+  done
+
+  mkdir -p -- "${OUTPUT_ROOT}"
+  chmod 0700 -- "${OUTPUT_ROOT}" || true
+  mkdir -p -- "${run_dir}"
+  chmod 0700 -- "${run_dir}" || true
+  uas_ensure_run_metadata "${run_dir}"
+
+  mkdir -p -- "${partial_dir}"
+  chmod 0700 -- "${partial_dir}"
+
+  cleanup_partial_on_signal() {
+    printf 'FAILED: interrupted\n' >"${partial_dir}/FAILED.txt" 2>/dev/null || true
+    chmod 0600 "${partial_dir}/FAILED.txt" 2>/dev/null || true
+  }
+  trap cleanup_partial_on_signal INT TERM
+
+  MANIFEST_LINES=()
+  set +e
+  uas_write_phase_metadata "${partial_dir}/metadata.txt"
+  uas_collect_system "${partial_dir}/system.txt"
+  uas_collect_repository "${partial_dir}/repository.txt"
+  uas_collect_filesystem "${partial_dir}/filesystem.txt"
+  uas_collect_networkmanager "${partial_dir}"
+  uas_collect_firewalld "${partial_dir}"
+  uas_collect_routing "${partial_dir}"
+  uas_collect_wireguard "${partial_dir}/wireguard-runtime.txt"
+  uas_collect_dns "${partial_dir}/dns.txt"
+  uas_collect_services "${partial_dir}/services.txt"
+  uas_collect_packages "${partial_dir}"
+  uas_collect_connectivity "${partial_dir}/connectivity.txt"
+  set -e
+
+  local manifest=""
+  local line
+  for line in "${MANIFEST_LINES[@]+"${MANIFEST_LINES[@]}"}"; do
+    manifest+="${line}"$'\n'
+  done
+  uas_write_file "${partial_dir}/manifest.txt" "${manifest}"
+
+  # Atomic publish: only if final phase still absent.
+  if [[ -e "${phase_dir}" ]]; then
+    printf 'FAILED: phase appeared during capture\n' >"${partial_dir}/FAILED.txt"
+    die "Phase directory appeared during capture; leaving partial at ${partial_dir}"
+  fi
+  mv -- "${partial_dir}" "${phase_dir}"
+  trap - INT TERM
+  chmod 0700 -- "${phase_dir}" || true
+  uas_chown_tree_if_sudo_user "${run_dir}"
+  log "Wrote phase snapshot: ${phase_dir}"
+  log "The collector never runs install.yml or uninstall.yml."
+}
+
+# Structural vs runtime file sets for compare mode.
+UAS_STRUCTURAL_FILES=(
+  filesystem.txt
+  networkmanager-connections.txt
+  networkmanager-active.txt
+  networkmanager-zones.txt
+  networkmanager-devices.txt
+  firewalld-permanent-zones.txt
+  firewalld-permanent-policies.txt
+  firewalld-project-objects.txt
+  firewalld-runtime-zones.txt
+  firewalld-runtime-policies.txt
+  firewalld-active-zones.txt
+  routing-ipv4.txt
+  routing-ipv6.txt
+  routing-rules.txt
+  dns.txt
+  services.txt
+  packages.txt
+  rpm-ostree.txt
+)
+
+UAS_RUNTIME_FILES=(
+  metadata.txt
+  system.txt
+  repository.txt
+  connectivity.txt
+  manifest.txt
+  wireguard-runtime.txt
+)
+
+uas_diff_file_lists() {
+  local left_dir="$1"
+  local right_dir="$2"
+  local out_file="$3"
+  shift 3
+  local f left right
+  local body=""
+  for f in "$@"; do
+    left="${left_dir}/${f}"
+    right="${right_dir}/${f}"
+    if [[ ! -f "${left}" && ! -f "${right}" ]]; then
+      body+="SKIP ${f} — missing in both"$'\n'
+      continue
+    fi
+    if [[ ! -f "${left}" ]]; then
+      body+="ONLY_RIGHT ${f}"$'\n'
+      continue
+    fi
+    if [[ ! -f "${right}" ]]; then
+      body+="ONLY_LEFT ${f}"$'\n'
+      continue
+    fi
+    if have_cmd diff; then
+      local d
+      set +e
+      d="$(diff -u -- "${left}" "${right}" 2>&1)"
+      local rc=$?
+      set -e
+      if ((rc == 0)); then
+        body+="SAME ${f}"$'\n'
+      else
+        body+="DIFF ${f}"$'\n'"${d}"$'\n'
+      fi
+    else
+      body+="SKIP ${f} — diff not available"$'\n'
+    fi
+  done
+  uas_write_file "${out_file}" "${body}"
+}
+
+uas_run_compare() {
+  # Compare mode may run as root or non-root; only reads existing snapshots.
+  uas_is_valid_run_name "${RUN_NAME}" || die "Invalid --run-name"
+  uas_output_root_is_safe "${OUTPUT_ROOT}" "${ROOT}" || die "Unsafe --output-root"
+  local run_dir
+  run_dir="$(readlink -m -- "${OUTPUT_ROOT}/${RUN_NAME}")"
+  [[ -d "${run_dir}" ]] || die "Run directory not found: ${run_dir}"
+
+  local stamp cmp_dir
+  stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+  cmp_dir="${run_dir}/comparisons/${stamp}.$$"
+  if [[ -e "${cmp_dir}" ]]; then
+    die "Comparison directory already exists: ${cmp_dir}"
+  fi
+  # Also refuse if same timestamp dir without pid exists
+  if [[ -e "${run_dir}/comparisons/${stamp}" ]]; then
+    die "Comparison timestamp collision: ${run_dir}/comparisons/${stamp}"
+  fi
+  mkdir -p -- "${run_dir}/comparisons"
+  chmod 0700 -- "${run_dir}/comparisons" || true
+  mkdir -p -- "${cmp_dir}"
+  chmod 0700 -- "${cmp_dir}"
+
+  local summary="" left right
+  summary+="compare_dir=${cmp_dir}"$'\n'
+  summary+="NOTE: No difference detected in captured structural state does not mean"$'\n'
+  summary+="the system was fully restored. Live semantics require manual review."$'\n'
+
+  pair_diff() {
+    local label="$1" a="$2" b="$3" outname="$4"
+    left="${run_dir}/${a}"
+    right="${run_dir}/${b}"
+    if [[ ! -d "${left}" || ! -d "${right}" ]]; then
+      summary+="SKIP ${label} — missing phase (${a} and/or ${b})"$'\n'
+      uas_write_file "${cmp_dir}/${outname}" "SKIP: missing phase directories"$'\n'
+      return 0
+    fi
+    uas_diff_file_lists "${left}" "${right}" "${cmp_dir}/${outname%.diff}.structural.diff" "${UAS_STRUCTURAL_FILES[@]}"
+    uas_diff_file_lists "${left}" "${right}" "${cmp_dir}/${outname%.diff}.runtime.diff" "${UAS_RUNTIME_FILES[@]}"
+    # Combined for the requested filename (structural primary + runtime note)
+    {
+      echo "=== STRUCTURAL ==="
+      cat "${cmp_dir}/${outname%.diff}.structural.diff"
+      echo
+      echo "=== RUNTIME / VOLATILE (informational) ==="
+      cat "${cmp_dir}/${outname%.diff}.runtime.diff"
+    } >"${cmp_dir}/${outname}"
+    chmod 0600 "${cmp_dir}/${outname}"
+    summary+="WROTE ${outname}"$'\n'
+    # Highlight project-oriented cues from structural diff text
+    if grep -E -q 'airvpn|vpn-underlay|airvpn-host|libexec/airvpn|/etc/airvpn-client' \
+      "${cmp_dir}/${outname%.diff}.structural.diff" 2>/dev/null; then
+      summary+="NOTE ${label}: structural diff mentions project-related paths or names"$'\n'
+    else
+      summary+="NOTE ${label}: No project-related path/name cues in structural diff text"$'\n'
+    fi
+  }
+
+  pair_diff "baseline-vs-uninstalled" baseline uninstalled baseline-vs-uninstalled.diff
+  pair_diff "baseline-vs-after-reboot" baseline after-reboot baseline-vs-after-reboot.diff
+  pair_diff "installed-vs-uninstalled" installed uninstalled installed-vs-uninstalled.diff
+
+  uas_write_file "${cmp_dir}/comparison-summary.txt" "${summary}"
+  uas_chown_tree_if_sudo_user "${cmp_dir}"
+  log "Wrote comparisons under ${cmp_dir}"
+  log "Compare mode did not run host collectors (nmcli/firewall-cmd/ip/wg/systemctl)."
+}
+
+uas_parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --run-name)
+        RUN_NAME="${2-}"
+        shift 2
+        ;;
+      --phase)
+        PHASE="${2-}"
+        shift 2
+        ;;
+      --output-root)
+        OUTPUT_ROOT="${2-}"
+        shift 2
+        ;;
+      --compare)
+        COMPARE_MODE=1
+        shift
+        ;;
+      --include-connectivity)
+        INCLUDE_CONNECTIVITY=1
+        shift
+        ;;
+      -h | --help)
+        usage
+        exit 0
+        ;;
+      --force | --overwrite)
+        die "Refusing ${1}: overwriting snapshots is not supported"
+        ;;
+      *)
+        die "Unknown argument: $1"
+        ;;
+    esac
+  done
+}
+
+uas_main() {
+  uas_parse_args "$@"
+  [[ -n "${ROOT}" && -f "${ROOT}/README.md" ]] || die "Could not establish repository root"
+  if ((COMPARE_MODE)); then
+    [[ -n "${RUN_NAME}" ]] || die "--run-name is required"
+    [[ -z "${PHASE}" ]] || die "--phase must not be set with --compare"
+    uas_run_compare
+    return 0
+  fi
+  [[ -n "${RUN_NAME}" ]] || {
+    usage
+    die "--run-name is required"
+  }
+  [[ -n "${PHASE}" ]] || {
+    usage
+    die "--phase is required in capture mode"
+  }
+  uas_run_capture
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  uas_main "$@"
+fi

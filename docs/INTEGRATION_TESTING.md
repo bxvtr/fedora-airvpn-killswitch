@@ -247,6 +247,65 @@ Artifacts default to `/tmp/fedora-airvpn-live-test-YYYYMMDD-HHMMSS/` (or
 `--output-dir`). Reports may still contain network metadata (endpoint / public
 IPs). Treat artifact directories as sensitive.
 
+## Manual uninstall state snapshots
+
+`tools/uninstall-audit-snapshot` is a **manual**, **read-only** collector for
+disposable Fedora VMs. It records host state into durable phase directories so
+you can compare baseline, installed, uninstalled, and after-reboot captures.
+
+It does **not**:
+
+- run `playbooks/install.yml` or `playbooks/uninstall.yml`
+- run `bootstrap.sh` or `tools/integration-test-vm`
+- mutate NetworkManager, firewalld, WireGuard, services, or packages
+- overwrite an existing phase directory (there is no `--force`)
+
+Run it yourself as root. Default output root is
+`/var/tmp/fedora-airvpn-uninstall-audit` so the same `--run-name` survives a
+reboot (`/tmp` is often wiped). Artifacts may contain network metadata (zones,
+routes, optional public IPs). Treat them as sensitive.
+
+Example:
+
+```bash
+sudo tools/uninstall-audit-snapshot \
+  --run-name silverblue43-v010 \
+  --phase baseline \
+  --include-connectivity
+
+# Install and exercise the project manually.
+
+sudo tools/uninstall-audit-snapshot \
+  --run-name silverblue43-v010 \
+  --phase installed \
+  --include-connectivity
+
+# Run the documented uninstall manually.
+
+sudo tools/uninstall-audit-snapshot \
+  --run-name silverblue43-v010 \
+  --phase uninstalled \
+  --include-connectivity
+
+# Reboot the disposable VM, then:
+
+sudo tools/uninstall-audit-snapshot \
+  --run-name silverblue43-v010 \
+  --phase after-reboot \
+  --include-connectivity
+
+sudo tools/uninstall-audit-snapshot \
+  --run-name silverblue43-v010 \
+  --compare
+```
+
+`--compare` only reads existing snapshots and writes under
+`comparisons/<timestamp>.<pid>/`. Missing phases are reported as `SKIP`.
+“No difference detected in captured structural state” is **not** a proof that
+the system was fully restored.
+
+Connectivity probes require explicit `--include-connectivity`.
+
 ## Distinguishing entry points
 
 Short reference (full decision table:
@@ -257,6 +316,7 @@ Short reference (full decision table:
 | `tools/validate-safe` | Static validation (non-destructive; no live networking proof) |
 | `./bootstrap.sh … --check` | Ansible check mode (best-effort; not a live integration test) |
 | `tools/integration-test-vm` | Live VM integration test (real install; not a dry run) |
+| `tools/uninstall-audit-snapshot` | Manual read-only host state snapshots for uninstall audits |
 | `./bootstrap.sh …` | Direct installation on the target host |
 | `airvpn-check --offline` / `--online` | Installed-state verification |
 

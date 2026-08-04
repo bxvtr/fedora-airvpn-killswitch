@@ -714,6 +714,18 @@ if grep -E -q '^[[:space:]]*(\./)?tools/integration-test-vm([[:space:]].*)?$' \
 else
   pass "validate-safe does not invoke live integration-test-vm"
 fi
+if grep -E -q '^[[:space:]]*(-[[:space:]]+)?(run:[[:space:]]*)?(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+  "${ROOT}/.github/workflows/"*.yml 2>/dev/null; then
+  fail "CI workflows must not execute tools/uninstall-audit-snapshot"
+else
+  pass "CI workflows do not execute uninstall-audit-snapshot"
+fi
+if grep -E -q '^[[:space:]]*(\./)?tools/uninstall-audit-snapshot([[:space:]].*)?$' \
+  "${ROOT}/tools/validate-safe"; then
+  fail "validate-safe must not invoke tools/uninstall-audit-snapshot"
+else
+  pass "validate-safe does not invoke uninstall-audit-snapshot"
+fi
 
 echo
 if ((FAILS > 0)); then

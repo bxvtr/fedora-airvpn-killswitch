@@ -51,6 +51,6 @@ jobs:
               -type f \( \
                 -name 'airvpn-*' -o -name '*.sh' \
                 -o -name 'validate-safe' -o -name 'check-agent-safety' \
-                -o -name 'integration-test-vm' \
+                -o -name 'integration-test-vm' -o -name 'uninstall-audit-snapshot' \
               \) -print0
           )

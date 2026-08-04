@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Manual read-only `tools/uninstall-audit-snapshot` collector for durable
+  baseline/installed/uninstalled/after-reboot host inventories and offline
+  structural comparisons on disposable Fedora VMs.
 - Initial public repository scaffold for Fedora AirVPN WireGuard + firewalld kill switch.
 - Direct-on-host bootstrap with pinned `ansible-core` virtualenv and pinned collections.
 - Ansible role for detection, dependencies, script install, NetworkManager hardening, and firewalld policies.
